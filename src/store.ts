@@ -1,0 +1,627 @@
+import { randomUUID } from "node:crypto"
+
+export type AgentRole = "MAIN" | "WORKER" | "APPROVER"
+export type AgentLifecycleStatus =
+  | "CREATING"
+  | "READY"
+  | "RUNNING"
+  | "WAITING_APPROVAL"
+  | "IDLE"
+  | "FAILED"
+  | "CANCELLED"
+export type WorkerTaskStatus = "PENDING" | "STARTING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED"
+export type PermissionStatus = "PENDING" | "APPROVED" | "REJECTED" | "FAILED"
+export type PermissionDecision = "once" | "always" | "reject"
+export type PermissionDecisionSource =
+  | "STATIC_POLICY"
+  | "APPROVAL_AGENT"
+  // Kept so databases created by milestone C can still be read.
+  | "MAIN_AGENT"
+  | "HUMAN"
+  | "EXTERNAL"
+export type PermissionRisk = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"
+
+export interface AgentInstance {
+  id: string
+  taskGroupId: string
+  parentAgentId?: string
+  role: AgentRole
+  name: string
+  opencodeSessionId: string
+  lifecycleStatus: AgentLifecycleStatus
+  lastError?: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface TaskGroup {
+  id: string
+  title: string
+  rootAgentId: string
+  status: "RUNNING" | "FAILED" | "CANCELLED"
+  createdAt: string
+  updatedAt: string
+}
+
+export interface WorkerTask {
+  id: string
+  taskGroupId: string
+  requestId: string
+  fieldKey: string
+  title: string
+  prompt: string
+  workerAgentId?: string
+  status: WorkerTaskStatus
+  error?: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface WorkerTaskInput {
+  fieldKey: string
+  title: string
+  prompt: string
+}
+
+export interface PermissionRequestRecord {
+  id: string
+  taskGroupId: string
+  agentId: string
+  opencodeRequestId: string
+  opencodeSessionId: string
+  action: string
+  resources: string[]
+  metadata: Record<string, unknown>
+  risk: PermissionRisk
+  status: PermissionStatus
+  reviewRequested: boolean
+  recommendationRequested?: boolean
+  decision?: PermissionDecision
+  decisionSource?: PermissionDecisionSource
+  rationale?: string
+  requestedAt: string
+  decidedAt?: string
+  updatedAt: string
+}
+
+export interface AuditRecord {
+  id: string
+  type: string
+  taskGroupId?: string
+  agentId?: string
+  permissionId?: string
+  data: Record<string, unknown>
+  createdAt: string
+}
+
+export interface AgentQuestion {
+  id: string
+  taskGroupId: string
+  workerAgentId: string
+  mainAgentId: string
+  question: string
+  context?: string
+  status: "OPEN" | "ANSWERED"
+  answer?: string
+  createdAt: string
+  answeredAt?: string
+  updatedAt: string
+}
+
+export interface StoreSnapshot {
+  schemaVersion: 1
+  taskGroups: TaskGroup[]
+  agents: AgentInstance[]
+  workerTasks: WorkerTask[]
+  spawnRequests: Array<{ key: string; taskIds: string[] }>
+  permissionRequests: PermissionRequestRecord[]
+  auditRecords: AuditRecord[]
+  agentQuestions: AgentQuestion[]
+}
+
+export interface StoreRecoveryResult {
+  activeAgents: number
+  missingAgents: number
+  resetAgents: number
+}
+
+export class InMemoryStore {
+  private readonly taskGroups = new Map<string, TaskGroup>()
+  private readonly agents = new Map<string, AgentInstance>()
+  private readonly agentBySession = new Map<string, string>()
+  private readonly workerTasks = new Map<string, WorkerTask>()
+  private readonly spawnRequests = new Map<string, string[]>()
+  private readonly permissionRequests = new Map<string, PermissionRequestRecord>()
+  private readonly permissionByExternalId = new Map<string, string>()
+  private readonly auditRecords: AuditRecord[] = []
+  private readonly agentQuestions = new Map<string, AgentQuestion>()
+
+  protected persist(): void {
+    // In-memory storage has nothing to flush. Persistent stores override this hook.
+  }
+
+  private touchTaskGroup(id: string, timestamp = new Date().toISOString()): void {
+    const current = this.taskGroups.get(id)
+    if (current !== undefined) this.taskGroups.set(id, { ...current, updatedAt: timestamp })
+  }
+
+  protected snapshot(): StoreSnapshot {
+    return {
+      schemaVersion: 1,
+      taskGroups: [...this.taskGroups.values()],
+      agents: [...this.agents.values()],
+      workerTasks: [...this.workerTasks.values()],
+      spawnRequests: [...this.spawnRequests.entries()].map(([key, taskIds]) => ({ key, taskIds: [...taskIds] })),
+      permissionRequests: [...this.permissionRequests.values()],
+      auditRecords: [...this.auditRecords],
+      agentQuestions: [...this.agentQuestions.values()],
+    }
+  }
+
+  protected restoreSnapshot(snapshot: StoreSnapshot): void {
+    this.taskGroups.clear()
+    this.agents.clear()
+    this.agentBySession.clear()
+    this.workerTasks.clear()
+    this.spawnRequests.clear()
+    this.permissionRequests.clear()
+    this.permissionByExternalId.clear()
+    this.auditRecords.splice(0)
+    this.agentQuestions.clear()
+
+    for (const taskGroup of snapshot.taskGroups) this.taskGroups.set(taskGroup.id, taskGroup)
+    for (const agent of snapshot.agents) {
+      this.agents.set(agent.id, agent)
+      this.agentBySession.set(agent.opencodeSessionId, agent.id)
+    }
+    for (const task of snapshot.workerTasks) this.workerTasks.set(task.id, task)
+    for (const request of snapshot.spawnRequests) this.spawnRequests.set(request.key, [...request.taskIds])
+    for (const permission of snapshot.permissionRequests) {
+      const compatible = {
+        ...permission,
+        reviewRequested: permission.reviewRequested ?? permission.recommendationRequested ?? false,
+      }
+      this.permissionRequests.set(permission.id, compatible)
+      this.permissionByExternalId.set(
+        `${permission.opencodeSessionId}:${permission.opencodeRequestId}`,
+        permission.id,
+      )
+    }
+    this.auditRecords.push(...snapshot.auditRecords)
+    for (const question of snapshot.agentQuestions ?? []) this.agentQuestions.set(question.id, question)
+  }
+
+  createTaskGroup(input: { title: string; sessionId: string }): { taskGroup: TaskGroup; agent: AgentInstance } {
+    const timestamp = new Date().toISOString()
+    const taskGroupId = randomUUID()
+    const agentId = randomUUID()
+
+    const taskGroup: TaskGroup = {
+      id: taskGroupId,
+      title: input.title,
+      rootAgentId: agentId,
+      status: "RUNNING",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    const agent: AgentInstance = {
+      id: agentId,
+      taskGroupId,
+      role: "MAIN",
+      name: input.title,
+      opencodeSessionId: input.sessionId,
+      lifecycleStatus: "READY",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+
+    this.taskGroups.set(taskGroup.id, taskGroup)
+    this.agents.set(agent.id, agent)
+    this.agentBySession.set(agent.opencodeSessionId, agent.id)
+    this.persist()
+    return { taskGroup, agent }
+  }
+
+  getTaskGroup(id: string): {
+    taskGroup: TaskGroup
+    agents: AgentInstance[]
+    workerTasks: WorkerTask[]
+    agentQuestions: AgentQuestion[]
+  } | undefined {
+    const taskGroup = this.taskGroups.get(id)
+    if (taskGroup === undefined) return undefined
+    const agents = [...this.agents.values()].filter((agent) => agent.taskGroupId === id)
+    const workerTasks = [...this.workerTasks.values()].filter((task) => task.taskGroupId === id)
+    const agentQuestions = [...this.agentQuestions.values()].filter((question) => question.taskGroupId === id)
+    return { taskGroup, agents, workerTasks, agentQuestions }
+  }
+
+  listTaskGroups(): Array<{
+    taskGroup: TaskGroup
+    agents: AgentInstance[]
+    workerTasks: WorkerTask[]
+    agentQuestions: AgentQuestion[]
+  }> {
+    return [...this.taskGroups.values()]
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+      .map((taskGroup) => this.getTaskGroup(taskGroup.id))
+      .filter((group) => group !== undefined)
+  }
+
+  getAgent(id: string): AgentInstance | undefined {
+    return this.agents.get(id)
+  }
+
+  getAgentBySession(sessionId: string): AgentInstance | undefined {
+    const agentId = this.agentBySession.get(sessionId)
+    return agentId === undefined ? undefined : this.agents.get(agentId)
+  }
+
+  setAgentStatus(
+    id: string,
+    lifecycleStatus: AgentLifecycleStatus,
+    lastError?: string,
+  ): AgentInstance | undefined {
+    const current = this.agents.get(id)
+    if (current === undefined) return undefined
+    const updated: AgentInstance = {
+      ...current,
+      lifecycleStatus,
+      lastError: lastError ?? current.lastError,
+      updatedAt: new Date().toISOString(),
+    }
+    this.agents.set(id, updated)
+    this.touchTaskGroup(current.taskGroupId, updated.updatedAt)
+    this.persist()
+    return updated
+  }
+
+  reserveWorkerTasks(input: {
+    taskGroupId: string
+    requestId: string
+    tasks: WorkerTaskInput[]
+  }): { created: boolean; tasks: WorkerTask[] } {
+    const key = `${input.taskGroupId}:${input.requestId}`
+    const existingIds = this.spawnRequests.get(key)
+    if (existingIds !== undefined) {
+      return {
+        created: false,
+        tasks: existingIds.map((id) => this.workerTasks.get(id)).filter((task) => task !== undefined),
+      }
+    }
+
+    const timestamp = new Date().toISOString()
+    const tasks = input.tasks.map<WorkerTask>((task) => ({
+      id: randomUUID(),
+      taskGroupId: input.taskGroupId,
+      requestId: input.requestId,
+      fieldKey: task.fieldKey,
+      title: task.title,
+      prompt: task.prompt,
+      status: "PENDING",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }))
+    for (const task of tasks) this.workerTasks.set(task.id, task)
+    this.spawnRequests.set(key, tasks.map((task) => task.id))
+    this.touchTaskGroup(input.taskGroupId, timestamp)
+    this.persist()
+    return { created: true, tasks }
+  }
+
+  getWorkerTasksByRequest(taskGroupId: string, requestId: string): WorkerTask[] {
+    const ids = this.spawnRequests.get(`${taskGroupId}:${requestId}`) ?? []
+    return ids.map((id) => this.workerTasks.get(id)).filter((task) => task !== undefined)
+  }
+
+  setWorkerTaskStatus(id: string, status: WorkerTaskStatus, error?: string): WorkerTask | undefined {
+    const current = this.workerTasks.get(id)
+    if (current === undefined) return undefined
+    const updated: WorkerTask = {
+      ...current,
+      status,
+      error: error ?? current.error,
+      updatedAt: new Date().toISOString(),
+    }
+    this.workerTasks.set(id, updated)
+    this.touchTaskGroup(current.taskGroupId, updated.updatedAt)
+    this.persist()
+    return updated
+  }
+
+  attachWorker(input: {
+    taskId: string
+    parentAgentId: string
+    sessionId: string
+  }): { task: WorkerTask; agent: AgentInstance } {
+    const task = this.workerTasks.get(input.taskId)
+    if (task === undefined) throw new Error("WORKER_TASK_NOT_FOUND")
+    const timestamp = new Date().toISOString()
+    const agent: AgentInstance = {
+      id: randomUUID(),
+      taskGroupId: task.taskGroupId,
+      parentAgentId: input.parentAgentId,
+      role: "WORKER",
+      name: task.title,
+      opencodeSessionId: input.sessionId,
+      lifecycleStatus: "READY",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    const updatedTask: WorkerTask = { ...task, workerAgentId: agent.id, updatedAt: timestamp }
+    this.agents.set(agent.id, agent)
+    this.agentBySession.set(agent.opencodeSessionId, agent.id)
+    this.workerTasks.set(task.id, updatedTask)
+    this.touchTaskGroup(task.taskGroupId, timestamp)
+    this.persist()
+    return { task: updatedTask, agent }
+  }
+
+  attachApprover(input: {
+    taskGroupId: string
+    parentAgentId: string
+    sessionId: string
+    name?: string
+  }): AgentInstance {
+    const taskGroup = this.taskGroups.get(input.taskGroupId)
+    if (taskGroup === undefined) throw new Error("TASK_GROUP_NOT_FOUND")
+    const timestamp = new Date().toISOString()
+    const agent: AgentInstance = {
+      id: randomUUID(),
+      taskGroupId: input.taskGroupId,
+      parentAgentId: input.parentAgentId,
+      role: "APPROVER",
+      name: input.name ?? "权限审批",
+      opencodeSessionId: input.sessionId,
+      lifecycleStatus: "READY",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    this.agents.set(agent.id, agent)
+    this.agentBySession.set(agent.opencodeSessionId, agent.id)
+    this.touchTaskGroup(input.taskGroupId, timestamp)
+    this.persist()
+    return agent
+  }
+
+  upsertPermissionRequest(input: {
+    agent: AgentInstance
+    opencodeRequestId: string
+    action: string
+    resources: string[]
+    metadata: Record<string, unknown>
+    risk: PermissionRisk
+  }): { created: boolean; permission: PermissionRequestRecord } {
+    const externalKey = `${input.agent.opencodeSessionId}:${input.opencodeRequestId}`
+    const existingId = this.permissionByExternalId.get(externalKey)
+    if (existingId !== undefined) {
+      const existing = this.permissionRequests.get(existingId)
+      if (existing !== undefined) return { created: false, permission: existing }
+    }
+
+    const timestamp = new Date().toISOString()
+    const permission: PermissionRequestRecord = {
+      id: randomUUID(),
+      taskGroupId: input.agent.taskGroupId,
+      agentId: input.agent.id,
+      opencodeRequestId: input.opencodeRequestId,
+      opencodeSessionId: input.agent.opencodeSessionId,
+      action: input.action,
+      resources: [...input.resources],
+      metadata: { ...input.metadata },
+      risk: input.risk,
+      status: "PENDING",
+      reviewRequested: false,
+      requestedAt: timestamp,
+      updatedAt: timestamp,
+    }
+    this.permissionRequests.set(permission.id, permission)
+    this.permissionByExternalId.set(externalKey, permission.id)
+    this.touchTaskGroup(input.agent.taskGroupId, timestamp)
+    this.persist()
+    return { created: true, permission }
+  }
+
+  getPermissionRequest(id: string): PermissionRequestRecord | undefined {
+    return this.permissionRequests.get(id)
+  }
+
+  getPermissionRequestByExternal(sessionId: string, requestId: string): PermissionRequestRecord | undefined {
+    const id = this.permissionByExternalId.get(`${sessionId}:${requestId}`)
+    return id === undefined ? undefined : this.permissionRequests.get(id)
+  }
+
+  listPermissionRequests(filter: { taskGroupId?: string; status?: PermissionStatus } = {}): PermissionRequestRecord[] {
+    return [...this.permissionRequests.values()]
+      .filter((permission) => filter.taskGroupId === undefined || permission.taskGroupId === filter.taskGroupId)
+      .filter((permission) => filter.status === undefined || permission.status === filter.status)
+      .sort((left, right) => right.requestedAt.localeCompare(left.requestedAt))
+  }
+
+  markPermissionReviewRequested(id: string): PermissionRequestRecord | undefined {
+    const current = this.permissionRequests.get(id)
+    if (current === undefined || current.status !== "PENDING") return current
+    const updated = { ...current, reviewRequested: true, updatedAt: new Date().toISOString() }
+    this.permissionRequests.set(id, updated)
+    this.touchTaskGroup(current.taskGroupId, updated.updatedAt)
+    this.persist()
+    return updated
+  }
+
+  resolvePermissionRequest(input: {
+    id: string
+    decision: PermissionDecision
+    source: PermissionDecisionSource
+    rationale?: string
+  }): PermissionRequestRecord | undefined {
+    const current = this.permissionRequests.get(input.id)
+    if (current === undefined || current.status !== "PENDING") return current
+    const timestamp = new Date().toISOString()
+    const updated: PermissionRequestRecord = {
+      ...current,
+      status: input.decision === "reject" ? "REJECTED" : "APPROVED",
+      decision: input.decision,
+      decisionSource: input.source,
+      rationale: input.rationale,
+      decidedAt: timestamp,
+      updatedAt: timestamp,
+    }
+    this.permissionRequests.set(input.id, updated)
+    this.touchTaskGroup(current.taskGroupId, timestamp)
+    this.persist()
+    return updated
+  }
+
+  failPermissionRequest(id: string, rationale: string): PermissionRequestRecord | undefined {
+    const current = this.permissionRequests.get(id)
+    if (current === undefined || current.status !== "PENDING") return current
+    const updated: PermissionRequestRecord = {
+      ...current,
+      status: "FAILED",
+      rationale,
+      updatedAt: new Date().toISOString(),
+    }
+    this.permissionRequests.set(id, updated)
+    this.touchTaskGroup(current.taskGroupId, updated.updatedAt)
+    this.persist()
+    return updated
+  }
+
+  hasPendingPermissionsForAgent(agentId: string): boolean {
+    return [...this.permissionRequests.values()].some(
+      (permission) => permission.agentId === agentId && permission.status === "PENDING",
+    )
+  }
+
+  appendAudit(input: Omit<AuditRecord, "id" | "createdAt">): AuditRecord {
+    const record: AuditRecord = { ...input, id: randomUUID(), createdAt: new Date().toISOString() }
+    this.auditRecords.push(record)
+    if (input.taskGroupId !== undefined) this.touchTaskGroup(input.taskGroupId, record.createdAt)
+    this.persist()
+    return record
+  }
+
+  listAuditRecords(limit = 100): AuditRecord[] {
+    return this.auditRecords.slice(-Math.max(1, limit)).reverse()
+  }
+
+  createAgentQuestion(input: {
+    worker: AgentInstance
+    main: AgentInstance
+    question: string
+    context?: string
+  }): AgentQuestion {
+    if (input.worker.role !== "WORKER" || input.main.role !== "MAIN") throw new Error("INVALID_AGENT_QUESTION")
+    if (input.worker.taskGroupId !== input.main.taskGroupId) throw new Error("AGENT_GROUP_MISMATCH")
+    const timestamp = new Date().toISOString()
+    const question: AgentQuestion = {
+      id: randomUUID(),
+      taskGroupId: input.worker.taskGroupId,
+      workerAgentId: input.worker.id,
+      mainAgentId: input.main.id,
+      question: input.question,
+      context: input.context,
+      status: "OPEN",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    this.agentQuestions.set(question.id, question)
+    this.touchTaskGroup(question.taskGroupId, timestamp)
+    this.persist()
+    return question
+  }
+
+  getAgentQuestion(id: string): AgentQuestion | undefined {
+    return this.agentQuestions.get(id)
+  }
+
+  listAgentQuestions(filter: { taskGroupId?: string; status?: AgentQuestion["status"] } = {}): AgentQuestion[] {
+    return [...this.agentQuestions.values()]
+      .filter((question) => filter.taskGroupId === undefined || question.taskGroupId === filter.taskGroupId)
+      .filter((question) => filter.status === undefined || question.status === filter.status)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+  }
+
+  answerAgentQuestion(id: string, answer: string): AgentQuestion | undefined {
+    const current = this.agentQuestions.get(id)
+    if (current === undefined || current.status === "ANSWERED") return current
+    const timestamp = new Date().toISOString()
+    const updated: AgentQuestion = {
+      ...current,
+      status: "ANSWERED",
+      answer,
+      answeredAt: timestamp,
+      updatedAt: timestamp,
+    }
+    this.agentQuestions.set(id, updated)
+    this.touchTaskGroup(updated.taskGroupId, timestamp)
+    this.persist()
+    return updated
+  }
+
+  recoverAgainstSessions(activeSessionIds: ReadonlySet<string>): StoreRecoveryResult {
+    let activeAgents = 0
+    let missingAgents = 0
+    let resetAgents = 0
+    const timestamp = new Date().toISOString()
+
+    for (const [agentId, agent] of this.agents) {
+      if (!activeSessionIds.has(agent.opencodeSessionId)) {
+        missingAgents += 1
+        this.agents.set(agentId, {
+          ...agent,
+          lifecycleStatus: "FAILED",
+          lastError: "OpenCode Session was not found during startup recovery.",
+          updatedAt: timestamp,
+        })
+        for (const [taskId, task] of this.workerTasks) {
+          if (task.workerAgentId === agentId && ["PENDING", "STARTING", "RUNNING"].includes(task.status)) {
+            this.workerTasks.set(taskId, {
+              ...task,
+              status: "FAILED",
+              error: "OpenCode Session was not found during startup recovery.",
+              updatedAt: timestamp,
+            })
+          }
+        }
+        if (agent.role === "MAIN") {
+          const taskGroup = this.taskGroups.get(agent.taskGroupId)
+          if (taskGroup !== undefined) {
+            this.taskGroups.set(taskGroup.id, { ...taskGroup, status: "FAILED", updatedAt: timestamp })
+          }
+        }
+        continue
+      }
+
+      activeAgents += 1
+      if (agent.lifecycleStatus === "CREATING" || agent.lifecycleStatus === "RUNNING") {
+        resetAgents += 1
+        this.agents.set(agentId, { ...agent, lifecycleStatus: "READY", updatedAt: timestamp })
+      }
+    }
+    this.persist()
+    return { activeAgents, missingAgents, resetAgents }
+  }
+
+  getStats(): {
+    taskGroups: number
+    agents: number
+    workerTasks: number
+    permissions: number
+    auditRecords: number
+    agentQuestions: number
+  } {
+    return {
+      taskGroups: this.taskGroups.size,
+      agents: this.agents.size,
+      workerTasks: this.workerTasks.size,
+      permissions: this.permissionRequests.size,
+      auditRecords: this.auditRecords.length,
+      agentQuestions: this.agentQuestions.size,
+    }
+  }
+
+  close(): void {
+    // Persistent stores override this method.
+  }
+}

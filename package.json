@@ -1,0 +1,16 @@
+{
+  "name": "opencode-control-plane",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A minimal control plane for managing OpenCode sessions.",
+  "scripts": {
+    "doctor": "node src/doctor.ts",
+    "dev": "node --watch src/index.ts",
+    "start": "node src/index.ts",
+    "test": "node --test --test-reporter=spec tests/*.test.ts"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
