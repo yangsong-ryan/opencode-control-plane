@@ -6,6 +6,8 @@ import {
   type AgentQuestion,
   type AgentInstance,
   type AuditRecord,
+  type ChangeReviewRecord,
+  type JobWatchRecord,
   type PermissionRequestRecord,
   type StoreSnapshot,
   type TaskGroup,
@@ -47,6 +49,8 @@ export class SqliteStore extends InMemoryStore {
         "permission_requests",
         "audit_records",
         "agent_questions",
+        "change_reviews",
+        "job_watches",
       ]) {
         database.exec(`DELETE FROM ${table}`)
       }
@@ -64,6 +68,8 @@ export class SqliteStore extends InMemoryStore {
       )
       this.insertJsonRows("audit_records", snapshot.auditRecords.map((item) => ({ id: item.id, item })))
       this.insertJsonRows("agent_questions", snapshot.agentQuestions.map((item) => ({ id: item.id, item })))
+      this.insertJsonRows("change_reviews", (snapshot.changeReviews ?? []).map((item) => ({ id: item.id, item })))
+      this.insertJsonRows("job_watches", (snapshot.jobWatches ?? []).map((item) => ({ id: item.id, item })))
       database.exec("COMMIT")
     } catch (error) {
       database.exec("ROLLBACK")
@@ -116,6 +122,14 @@ export class SqliteStore extends InMemoryStore {
         id TEXT PRIMARY KEY,
         data_json TEXT NOT NULL CHECK(json_valid(data_json))
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS change_reviews (
+        id TEXT PRIMARY KEY,
+        data_json TEXT NOT NULL CHECK(json_valid(data_json))
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS job_watches (
+        id TEXT PRIMARY KEY,
+        data_json TEXT NOT NULL CHECK(json_valid(data_json))
+      ) STRICT;
     `)
     database
       .prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)")
@@ -123,6 +137,12 @@ export class SqliteStore extends InMemoryStore {
     database
       .prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)")
       .run(2, new Date().toISOString())
+    database
+      .prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+      .run(3, new Date().toISOString())
+    database
+      .prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+      .run(4, new Date().toISOString())
   }
 
   private loadSnapshot(): StoreSnapshot {
@@ -143,6 +163,8 @@ export class SqliteStore extends InMemoryStore {
         left.createdAt.localeCompare(right.createdAt),
       ),
       agentQuestions: read<AgentQuestion>("agent_questions"),
+      changeReviews: read<ChangeReviewRecord>("change_reviews"),
+      jobWatches: read<JobWatchRecord>("job_watches"),
     }
   }
 

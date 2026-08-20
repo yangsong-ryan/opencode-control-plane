@@ -28,6 +28,7 @@ export interface AgentInstance {
   role: AgentRole
   name: string
   opencodeSessionId: string
+  opencodeAgentName: string
   lifecycleStatus: AgentLifecycleStatus
   lastError?: string
   createdAt: string
@@ -50,6 +51,7 @@ export interface WorkerTask {
   fieldKey: string
   title: string
   prompt: string
+  agentName: string
   workerAgentId?: string
   status: WorkerTaskStatus
   error?: string
@@ -61,6 +63,7 @@ export interface WorkerTaskInput {
   fieldKey: string
   title: string
   prompt: string
+  agentName: string
 }
 
 export interface PermissionRequestRecord {
@@ -108,6 +111,60 @@ export interface AgentQuestion {
   updatedAt: string
 }
 
+export type ChangeReviewStatus = "PENDING" | "APPROVED" | "REJECTED"
+
+export interface ChangeReviewRow {
+  kind: "context" | "modified" | "added" | "deleted"
+  beforeLine?: number
+  afterLine?: number
+  beforeText?: string
+  afterText?: string
+}
+
+export interface ChangeReviewFile {
+  path: string
+  beforePath: string
+  afterPath: string
+  diff: string
+  additions: number
+  deletions: number
+  rows: ChangeReviewRow[]
+}
+
+export interface ChangeReviewRecord {
+  id: string
+  taskGroupId: string
+  agentId: string
+  summary: string
+  files: ChangeReviewFile[]
+  additions: number
+  deletions: number
+  status: ChangeReviewStatus
+  rationale?: string
+  requestedAt: string
+  decidedAt?: string
+  updatedAt: string
+}
+
+export type JobWatchStatus = "SCHEDULED" | "DELIVERED" | "CANCELLED" | "FAILED"
+
+export interface JobWatchRecord {
+  id: string
+  taskGroupId: string
+  agentId: string
+  opencodeSessionId: string
+  title: string
+  wakeMessage: string
+  wakeAt: string
+  status: JobWatchStatus
+  idempotencyKey?: string
+  createdAt: string
+  updatedAt: string
+  deliveredAt?: string
+  cancelledAt?: string
+  lastError?: string
+}
+
 export interface StoreSnapshot {
   schemaVersion: 1
   taskGroups: TaskGroup[]
@@ -117,6 +174,8 @@ export interface StoreSnapshot {
   permissionRequests: PermissionRequestRecord[]
   auditRecords: AuditRecord[]
   agentQuestions: AgentQuestion[]
+  changeReviews?: ChangeReviewRecord[]
+  jobWatches?: JobWatchRecord[]
 }
 
 export interface StoreRecoveryResult {
@@ -135,6 +194,8 @@ export class InMemoryStore {
   private readonly permissionByExternalId = new Map<string, string>()
   private readonly auditRecords: AuditRecord[] = []
   private readonly agentQuestions = new Map<string, AgentQuestion>()
+  private readonly changeReviews = new Map<string, ChangeReviewRecord>()
+  private readonly jobWatches = new Map<string, JobWatchRecord>()
 
   protected persist(): void {
     // In-memory storage has nothing to flush. Persistent stores override this hook.
@@ -155,6 +216,8 @@ export class InMemoryStore {
       permissionRequests: [...this.permissionRequests.values()],
       auditRecords: [...this.auditRecords],
       agentQuestions: [...this.agentQuestions.values()],
+      changeReviews: [...this.changeReviews.values()],
+      jobWatches: [...this.jobWatches.values()],
     }
   }
 
@@ -168,13 +231,18 @@ export class InMemoryStore {
     this.permissionByExternalId.clear()
     this.auditRecords.splice(0)
     this.agentQuestions.clear()
+    this.changeReviews.clear()
+    this.jobWatches.clear()
 
     for (const taskGroup of snapshot.taskGroups) this.taskGroups.set(taskGroup.id, taskGroup)
     for (const agent of snapshot.agents) {
-      this.agents.set(agent.id, agent)
-      this.agentBySession.set(agent.opencodeSessionId, agent.id)
+      const compatible = { ...agent, opencodeAgentName: agent.opencodeAgentName ?? "build" }
+      this.agents.set(agent.id, compatible)
+      this.agentBySession.set(compatible.opencodeSessionId, compatible.id)
     }
-    for (const task of snapshot.workerTasks) this.workerTasks.set(task.id, task)
+    for (const task of snapshot.workerTasks) {
+      this.workerTasks.set(task.id, { ...task, agentName: task.agentName ?? "build" })
+    }
     for (const request of snapshot.spawnRequests) this.spawnRequests.set(request.key, [...request.taskIds])
     for (const permission of snapshot.permissionRequests) {
       const compatible = {
@@ -189,9 +257,11 @@ export class InMemoryStore {
     }
     this.auditRecords.push(...snapshot.auditRecords)
     for (const question of snapshot.agentQuestions ?? []) this.agentQuestions.set(question.id, question)
+    for (const review of snapshot.changeReviews ?? []) this.changeReviews.set(review.id, review)
+    for (const watch of snapshot.jobWatches ?? []) this.jobWatches.set(watch.id, watch)
   }
 
-  createTaskGroup(input: { title: string; sessionId: string }): { taskGroup: TaskGroup; agent: AgentInstance } {
+  createTaskGroup(input: { title: string; sessionId: string; agentName?: string }): { taskGroup: TaskGroup; agent: AgentInstance } {
     const timestamp = new Date().toISOString()
     const taskGroupId = randomUUID()
     const agentId = randomUUID()
@@ -210,6 +280,7 @@ export class InMemoryStore {
       role: "MAIN",
       name: input.title,
       opencodeSessionId: input.sessionId,
+      opencodeAgentName: input.agentName ?? "build",
       lifecycleStatus: "READY",
       createdAt: timestamp,
       updatedAt: timestamp,
@@ -257,6 +328,24 @@ export class InMemoryStore {
     return agentId === undefined ? undefined : this.agents.get(agentId)
   }
 
+  migrateSystemAgentNames(input: { mainAgentName: string; approvalAgentName: string }): number {
+    let migrated = 0
+    const timestamp = new Date().toISOString()
+    for (const [id, agent] of this.agents) {
+      const target = agent.role === "MAIN"
+        ? input.mainAgentName
+        : agent.role === "APPROVER"
+          ? input.approvalAgentName
+          : undefined
+      if (target === undefined || agent.opencodeAgentName !== "build") continue
+      this.agents.set(id, { ...agent, opencodeAgentName: target, updatedAt: timestamp })
+      this.touchTaskGroup(agent.taskGroupId, timestamp)
+      migrated += 1
+    }
+    if (migrated > 0) this.persist()
+    return migrated
+  }
+
   setAgentStatus(
     id: string,
     lifecycleStatus: AgentLifecycleStatus,
@@ -298,6 +387,7 @@ export class InMemoryStore {
       fieldKey: task.fieldKey,
       title: task.title,
       prompt: task.prompt,
+      agentName: task.agentName,
       status: "PENDING",
       createdAt: timestamp,
       updatedAt: timestamp,
@@ -344,6 +434,7 @@ export class InMemoryStore {
       role: "WORKER",
       name: task.title,
       opencodeSessionId: input.sessionId,
+      opencodeAgentName: task.agentName,
       lifecycleStatus: "READY",
       createdAt: timestamp,
       updatedAt: timestamp,
@@ -362,6 +453,7 @@ export class InMemoryStore {
     parentAgentId: string
     sessionId: string
     name?: string
+    agentName?: string
   }): AgentInstance {
     const taskGroup = this.taskGroups.get(input.taskGroupId)
     if (taskGroup === undefined) throw new Error("TASK_GROUP_NOT_FOUND")
@@ -373,6 +465,7 @@ export class InMemoryStore {
       role: "APPROVER",
       name: input.name ?? "权限审批",
       opencodeSessionId: input.sessionId,
+      opencodeAgentName: input.agentName ?? "build",
       lifecycleStatus: "READY",
       createdAt: timestamp,
       updatedAt: timestamp,
@@ -559,6 +652,162 @@ export class InMemoryStore {
     return updated
   }
 
+  createChangeReview(input: {
+    agent: AgentInstance
+    summary: string
+    files: ChangeReviewFile[]
+  }): ChangeReviewRecord {
+    const timestamp = new Date().toISOString()
+    const review: ChangeReviewRecord = {
+      id: randomUUID(),
+      taskGroupId: input.agent.taskGroupId,
+      agentId: input.agent.id,
+      summary: input.summary,
+      files: input.files.map((file) => ({ ...file })),
+      additions: input.files.reduce((sum, file) => sum + file.additions, 0),
+      deletions: input.files.reduce((sum, file) => sum + file.deletions, 0),
+      status: "PENDING",
+      requestedAt: timestamp,
+      updatedAt: timestamp,
+    }
+    this.changeReviews.set(review.id, review)
+    this.touchTaskGroup(input.agent.taskGroupId, timestamp)
+    this.persist()
+    return review
+  }
+
+  getChangeReview(id: string): ChangeReviewRecord | undefined {
+    return this.changeReviews.get(id)
+  }
+
+  listChangeReviews(filter: { taskGroupId?: string; status?: ChangeReviewStatus } = {}): ChangeReviewRecord[] {
+    return [...this.changeReviews.values()]
+      .filter((review) => filter.taskGroupId === undefined || review.taskGroupId === filter.taskGroupId)
+      .filter((review) => filter.status === undefined || review.status === filter.status)
+      .sort((left, right) => right.requestedAt.localeCompare(left.requestedAt))
+  }
+
+  decideChangeReview(input: {
+    id: string
+    decision: "approve" | "reject"
+    rationale?: string
+  }): ChangeReviewRecord | undefined {
+    const current = this.changeReviews.get(input.id)
+    if (current === undefined || current.status !== "PENDING") return current
+    const timestamp = new Date().toISOString()
+    const status = input.decision === "approve" ? "APPROVED" : "REJECTED"
+    const updated: ChangeReviewRecord = {
+      ...current,
+      status,
+      rationale: input.rationale,
+      decidedAt: timestamp,
+      updatedAt: timestamp,
+    }
+    this.changeReviews.set(updated.id, updated)
+    this.touchTaskGroup(current.taskGroupId, timestamp)
+    this.persist()
+    return updated
+  }
+
+  createJobWatch(input: {
+    agent: AgentInstance
+    title: string
+    wakeMessage: string
+    wakeAt: string
+    idempotencyKey?: string
+  }): { created: boolean; watch: JobWatchRecord } {
+    if (input.idempotencyKey !== undefined) {
+      const existing = [...this.jobWatches.values()].find(
+        (watch) => watch.agentId === input.agent.id && watch.idempotencyKey === input.idempotencyKey,
+      )
+      if (existing !== undefined) return { created: false, watch: existing }
+    }
+
+    const timestamp = new Date().toISOString()
+    const watch: JobWatchRecord = {
+      id: randomUUID(),
+      taskGroupId: input.agent.taskGroupId,
+      agentId: input.agent.id,
+      opencodeSessionId: input.agent.opencodeSessionId,
+      title: input.title,
+      wakeMessage: input.wakeMessage,
+      wakeAt: input.wakeAt,
+      status: "SCHEDULED",
+      idempotencyKey: input.idempotencyKey,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    this.jobWatches.set(watch.id, watch)
+    this.touchTaskGroup(watch.taskGroupId, timestamp)
+    this.persist()
+    return { created: true, watch }
+  }
+
+  getJobWatch(id: string): JobWatchRecord | undefined {
+    return this.jobWatches.get(id)
+  }
+
+  listJobWatches(filter: {
+    taskGroupId?: string
+    agentId?: string
+    status?: JobWatchStatus
+  } = {}): JobWatchRecord[] {
+    return [...this.jobWatches.values()]
+      .filter((watch) => filter.taskGroupId === undefined || watch.taskGroupId === filter.taskGroupId)
+      .filter((watch) => filter.agentId === undefined || watch.agentId === filter.agentId)
+      .filter((watch) => filter.status === undefined || watch.status === filter.status)
+      .sort((left, right) => left.wakeAt.localeCompare(right.wakeAt))
+  }
+
+  deliverJobWatch(id: string): JobWatchRecord | undefined {
+    const current = this.jobWatches.get(id)
+    if (current === undefined || current.status !== "SCHEDULED") return current
+    const timestamp = new Date().toISOString()
+    const updated: JobWatchRecord = {
+      ...current,
+      status: "DELIVERED",
+      deliveredAt: timestamp,
+      updatedAt: timestamp,
+      lastError: undefined,
+    }
+    this.jobWatches.set(id, updated)
+    this.touchTaskGroup(current.taskGroupId, timestamp)
+    this.persist()
+    return updated
+  }
+
+  failJobWatch(id: string, error: string): JobWatchRecord | undefined {
+    const current = this.jobWatches.get(id)
+    if (current === undefined || current.status !== "SCHEDULED") return current
+    const timestamp = new Date().toISOString()
+    const updated: JobWatchRecord = {
+      ...current,
+      status: "FAILED",
+      lastError: error,
+      updatedAt: timestamp,
+    }
+    this.jobWatches.set(id, updated)
+    this.touchTaskGroup(current.taskGroupId, timestamp)
+    this.persist()
+    return updated
+  }
+
+  cancelJobWatch(id: string): JobWatchRecord | undefined {
+    const current = this.jobWatches.get(id)
+    if (current === undefined || current.status !== "SCHEDULED") return current
+    const timestamp = new Date().toISOString()
+    const updated: JobWatchRecord = {
+      ...current,
+      status: "CANCELLED",
+      cancelledAt: timestamp,
+      updatedAt: timestamp,
+    }
+    this.jobWatches.set(id, updated)
+    this.touchTaskGroup(current.taskGroupId, timestamp)
+    this.persist()
+    return updated
+  }
+
   recoverAgainstSessions(activeSessionIds: ReadonlySet<string>): StoreRecoveryResult {
     let activeAgents = 0
     let missingAgents = 0
@@ -610,6 +859,8 @@ export class InMemoryStore {
     permissions: number
     auditRecords: number
     agentQuestions: number
+    changeReviews: number
+    jobWatches: number
   } {
     return {
       taskGroups: this.taskGroups.size,
@@ -618,6 +869,8 @@ export class InMemoryStore {
       permissions: this.permissionRequests.size,
       auditRecords: this.auditRecords.length,
       agentQuestions: this.agentQuestions.size,
+      changeReviews: this.changeReviews.size,
+      jobWatches: this.jobWatches.size,
     }
   }
 

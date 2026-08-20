@@ -1,7 +1,7 @@
 import type { ControlPlaneConfig } from "./config.ts"
 import type { EventHub } from "./event-hub.ts"
 import type { OpenCodeAdapter } from "./opencode-adapter.ts"
-import { mainAgentSystem, mainAgentTools, workerAgentSystem, workerAgentTools } from "./agent-prompts.ts"
+import { mainAgentSystem, workerAgentSystem } from "./agent-prompts.ts"
 import { InMemoryStore, type AgentInstance, type AgentQuestion } from "./store.ts"
 
 export class AgentCommunicationManager {
@@ -41,9 +41,9 @@ export class AgentCommunicationManager {
       data: { questionId: question.id, mainAgentId: main.id, question: input.question },
     })
     await this.adapter.sendAsync(main.opencodeSessionId, {
+      agent: main.opencodeAgentName,
       model: this.config.opencodeModel,
       system: mainAgentSystem,
-      tools: mainAgentTools,
       text: [
         `Worker “${worker.name}” needs your decision or guidance.`,
         `Question ID: ${question.id}`,
@@ -74,9 +74,9 @@ export class AgentCommunicationManager {
 
     if (question.status === "OPEN") {
       await this.adapter.sendAsync(worker.opencodeSessionId, {
+        agent: worker.opencodeAgentName,
         model: this.config.opencodeModel,
         system: workerAgentSystem,
-        tools: workerAgentTools,
         text: [
           "Your main Agent answered your earlier question.",
           `Question: ${question.question}`,
@@ -114,6 +114,31 @@ export class AgentCommunicationManager {
       }))
   }
 
+  async listAgentTypes(callerSessionId: string): Promise<Array<{
+    name: string
+    description?: string
+    mode?: "primary" | "subagent" | "all"
+    native: boolean
+  }>> {
+    this.requireRole(callerSessionId, "MAIN")
+    const agents = await this.adapter.listAgents()
+    return agents
+      .filter((agent) => agent.hidden !== true)
+      .map((agent) => ({
+        name: agent.name,
+        description: agent.description,
+        mode: agent.mode,
+        native: agent.native === true,
+      }))
+      .sort((left, right) => left.name.localeCompare(right.name))
+  }
+
+  listActiveAgents(callerSessionId: string): ReturnType<AgentCommunicationManager["listWorkers"]> {
+    return this.listWorkers(callerSessionId).filter(({ agent }) =>
+      agent.lifecycleStatus !== "FAILED",
+    )
+  }
+
   async messageWorker(input: {
     callerSessionId: string
     workerAgentId: string
@@ -125,9 +150,9 @@ export class AgentCommunicationManager {
       throw new Error("WORKER_DOES_NOT_BELONG_TO_MAIN_AGENT")
     }
     await this.adapter.sendAsync(worker.opencodeSessionId, {
+      agent: worker.opencodeAgentName,
       model: this.config.opencodeModel,
       system: workerAgentSystem,
-      tools: workerAgentTools,
       text: `Supervisory message from your main Agent:\n${input.message}\nContinue your work accordingly.`,
     })
     this.store.appendAudit({

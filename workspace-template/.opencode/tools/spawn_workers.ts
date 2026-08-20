@@ -2,12 +2,13 @@ import { tool } from "@opencode-ai/plugin"
 
 export default tool({
   description:
-    "Create the independent OpenCode worker sessions that you, as the main Agent, decided are useful for this task. The user does not choose the worker count.",
+    "Create independent OpenCode worker sessions only after list_agent_types and list_active_agents confirm that no suitable existing worker can be reused.",
   args: {
     request_id: tool.schema.string().describe("A stable unique ID. Reuse it when retrying the same batch."),
     tasks: tool.schema
       .array(
         tool.schema.object({
+          agent_name: tool.schema.string().describe("Exact OpenCode Agent name returned by list_agent_types"),
           field_key: tool.schema.string().describe("Stable machine-readable field identifier"),
           title: tool.schema.string().describe("Short worker display name"),
           prompt: tool.schema.string().describe("Complete self-contained investigation prompt for this worker"),

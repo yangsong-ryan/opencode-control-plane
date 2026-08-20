@@ -9,6 +9,9 @@ export interface ControlPlaneConfig {
   opencodeUsername?: string
   opencodePassword?: string
   opencodeModel?: { providerID: string; modelID: string }
+  mainAgentName: string
+  approvalAgentName: string
+  defaultWorkerAgentName: string
   maxConcurrentWorkers: number
   toolToken?: string
   maxRequestBytes: number
@@ -48,7 +51,9 @@ function readProjectModel(directory: string): { providerID: string; modelID: str
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneConfig {
-  const directory = env.OPENCODE_DIRECTORY ?? process.cwd()
+  const backendDirectory = process.cwd()
+  const bundledWorkspace = resolve(backendDirectory, "workspace-template")
+  const directory = resolve(env.OPENCODE_DIRECTORY ?? (existsSync(bundledWorkspace) ? bundledWorkspace : backendDirectory))
   const baseUrl = env.OPENCODE_BASE_URL ?? "http://127.0.0.1:4096"
   const providerID = env.OPENCODE_PROVIDER_ID?.trim()
   const modelID = env.OPENCODE_MODEL_ID?.trim()
@@ -66,12 +71,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneCo
     opencodeUsername: env.OPENCODE_SERVER_USERNAME,
     opencodePassword: env.OPENCODE_SERVER_PASSWORD,
     opencodeModel: providerID !== undefined && modelID !== undefined ? { providerID, modelID } : projectModel,
+    mainAgentName: env.CONTROL_PLANE_MAIN_AGENT?.trim() || "control-plane-main",
+    approvalAgentName: env.CONTROL_PLANE_APPROVAL_AGENT?.trim() || "permission-approver",
+    defaultWorkerAgentName: env.CONTROL_PLANE_DEFAULT_WORKER_AGENT?.trim() || "control-plane-worker",
     maxConcurrentWorkers: parsePositiveInteger(env.MAX_CONCURRENT_WORKERS, 3),
     toolToken: env.CONTROL_PLANE_TOOL_TOKEN,
     maxRequestBytes: parsePositiveInteger(env.MAX_REQUEST_BYTES, 1_048_576),
     databasePath:
       env.CONTROL_PLANE_DATABASE_PATH === ":memory:"
         ? ":memory:"
-        : resolve(env.CONTROL_PLANE_DATABASE_PATH ?? resolve(directory, ".data/opencode-control-plane.sqlite")),
+        : resolve(env.CONTROL_PLANE_DATABASE_PATH ?? resolve(backendDirectory, ".data/opencode-control-plane.sqlite")),
   }
 }

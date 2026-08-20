@@ -1,8 +1,7 @@
 import type { ControlPlaneConfig } from "./config.ts"
 import type { EventHub } from "./event-hub.ts"
 import type { OpenCodeAdapter } from "./opencode-adapter.ts"
-import { workerAgentSystem, workerAgentTools } from "./agent-prompts.ts"
-import { workerSessionPermissionRules } from "./permission-manager.ts"
+import { workerAgentSystem } from "./agent-prompts.ts"
 import { InMemoryStore, type AgentInstance, type WorkerTask, type WorkerTaskInput } from "./store.ts"
 
 export interface SpawnWorkersInput {
@@ -56,6 +55,13 @@ export class Orchestrator {
     if (mainAgent === undefined || mainAgent.role !== "MAIN") throw new Error("MAIN_AGENT_NOT_FOUND")
     if (mainAgent.opencodeSessionId !== input.callerSessionId) throw new Error("CALLER_IS_NOT_MAIN_AGENT")
 
+    const availableAgentNames = new Set(
+      (await this.adapter.listAgents()).filter((agent) => agent.hidden !== true).map((agent) => agent.name),
+    )
+    if (input.tasks.some((task) => !availableAgentNames.has(task.agentName))) {
+      throw new Error("AGENT_TYPE_NOT_FOUND")
+    }
+
     const key = `${input.taskGroupId}:${input.requestId}`
     const active = this.inflight.get(key)
     if (active !== undefined) {
@@ -91,7 +97,6 @@ export class Orchestrator {
           title: `${mainAgent.name} / ${task.title}`,
           parentSessionId: mainAgent.opencodeSessionId,
           model: this.config.opencodeModel,
-          permission: workerSessionPermissionRules,
         })
         worker = this.store.attachWorker({
           taskId: task.id,
@@ -99,10 +104,10 @@ export class Orchestrator {
           sessionId: session.id,
         }).agent
         await this.adapter.sendAsync(session.id, {
+          agent: task.agentName,
           text: task.prompt,
           model: this.config.opencodeModel,
           system: workerAgentSystem,
-          tools: workerAgentTools,
         })
         this.store.setAgentStatus(worker.id, "RUNNING")
         this.store.setWorkerTaskStatus(task.id, "RUNNING")

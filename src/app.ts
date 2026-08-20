@@ -4,24 +4,18 @@ import type { AddressInfo } from "node:net"
 import type { ControlPlaneConfig } from "./config.ts"
 import { EventHub } from "./event-hub.ts"
 import { AgentCommunicationManager } from "./agent-communication-manager.ts"
+import { ChangeReviewManager } from "./change-review-manager.ts"
 import {
   approvalAgentSystem,
-  approvalAgentTools,
   mainAgentSystem,
-  mainAgentTools,
   workerAgentSystem,
-  workerAgentTools,
 } from "./agent-prompts.ts"
 import { renderHomePage } from "./home-page.ts"
 import { OpenCodeAdapter, OpenCodeHttpError, type OpenCodeCapabilities } from "./opencode-adapter.ts"
 import { Orchestrator } from "./orchestrator.ts"
 import { SqliteStore } from "./sqlite-store.ts"
-import {
-  approverSessionPermissionRules,
-  mainSessionPermissionRules,
-  PermissionManager,
-  type PermissionReview,
-} from "./permission-manager.ts"
+import { WatchJobManager } from "./watch-job-manager.ts"
+import { PermissionManager, type PermissionReview } from "./permission-manager.ts"
 import {
   InMemoryStore,
   type PermissionDecision,
@@ -84,7 +78,7 @@ function requiredString(value: unknown, name: string): string {
   return value.trim()
 }
 
-function workerTaskInputs(value: unknown): WorkerTaskInput[] {
+function workerTaskInputs(value: unknown, defaultAgentName: string): WorkerTaskInput[] {
   if (!Array.isArray(value) || value.length === 0 || value.length > 20) throw new Error("INVALID_TASKS")
   return value.map((item, index) => {
     if (item === null || Array.isArray(item) || typeof item !== "object") throw new Error("INVALID_TASKS")
@@ -93,6 +87,10 @@ function workerTaskInputs(value: unknown): WorkerTaskInput[] {
       fieldKey: requiredString(record.field_key ?? record.fieldKey, `tasks_${index}_field_key`),
       title: requiredString(record.title, `tasks_${index}_title`),
       prompt: requiredString(record.prompt, `tasks_${index}_prompt`),
+      agentName:
+        typeof (record.agent_name ?? record.agentName) === "string" && String(record.agent_name ?? record.agentName).trim() !== ""
+          ? String(record.agent_name ?? record.agentName).trim()
+          : defaultAgentName,
     }
   })
 }
@@ -109,10 +107,25 @@ function permissionReview(value: unknown): PermissionReview {
   return value
 }
 
+function changeReviewDecision(value: unknown): "approve" | "reject" {
+  if (value !== "approve" && value !== "reject") throw new Error("INVALID_CHANGE_REVIEW_DECISION")
+  return value
+}
+
+function watchDelaySeconds(value: unknown): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 604_800) {
+    throw new Error("INVALID_DELAY_SECONDS")
+  }
+  return value
+}
+
 function emptyAssistantWarning(messages: Array<{ info?: Record<string, unknown>; parts?: unknown[] }>): string | undefined {
-  const last = messages.at(-1)
-  if (last?.info?.role !== "assistant") return undefined
-  if (last.info.error !== undefined) {
+  const lastUserIndex = messages.findLastIndex((message) => message.info?.role === "user")
+  const currentTurn = messages.slice(lastUserIndex + 1)
+  const assistants = currentTurn.filter((message) => message.info?.role === "assistant")
+  const last = assistants.at(-1)
+  if (last === undefined) return undefined
+  if (last.info?.error !== undefined) {
     const error = last.info.error
     if (typeof error === "string") return `OpenCode 模型调用失败：${error}`
     if (error !== null && typeof error === "object") {
@@ -123,8 +136,23 @@ function emptyAssistantWarning(messages: Array<{ info?: Record<string, unknown>;
       return `OpenCode 模型调用失败：${JSON.stringify(error)}`
     }
   }
-  if ((last.parts?.length ?? 0) > 0) return undefined
-  const tokens = last.info.tokens as { output?: number } | undefined
+  const hasMeaningfulOutput = assistants.some((message) =>
+    (message.parts ?? []).some((part) => {
+      if (part === null || typeof part !== "object") return false
+      const value = part as Record<string, unknown>
+      if (value.type === "text" || value.type === "reasoning") {
+        return typeof value.text === "string" && value.text.trim() !== ""
+      }
+      return value.type === "tool"
+    })
+  )
+  if (hasMeaningfulOutput) return undefined
+  const time = last.info?.time
+  const completed =
+    (time !== null && typeof time === "object" && typeof (time as Record<string, unknown>).completed === "number") ||
+    typeof last.info?.finish === "string"
+  if (!completed) return undefined
+  const tokens = last.info?.tokens as { output?: number } | undefined
   if (tokens?.output === 0) {
     return "OpenCode 已结束本轮运行，但模型返回了零 token 和空内容。请配置一个可用模型后重试。"
   }
@@ -135,6 +163,7 @@ function requiredRoutesAvailable(capabilities: OpenCodeCapabilities): boolean {
   const routes = capabilities.routes
   return (
     capabilities.healthy &&
+    routes.listAgents &&
     routes.createSession &&
     routes.listSessions &&
     routes.listMessages &&
@@ -156,8 +185,10 @@ export function createApplication(options: ApplicationOptions) {
   const store = options.store ?? new SqliteStore(options.config.databasePath)
   const events = new EventHub()
   const orchestrator = new Orchestrator(store, adapter, events, options.config)
+  const changeReviewManager = new ChangeReviewManager(store, events, options.config)
   const permissionManager = new PermissionManager(store, adapter, events, options.config)
   const communicationManager = new AgentCommunicationManager(store, adapter, events, options.config)
+  const watchJobManager = new WatchJobManager(store, adapter, events, options.config)
   const relayController = new AbortController()
   let capabilities: OpenCodeCapabilities | undefined
   let initialized = false
@@ -220,6 +251,38 @@ export function createApplication(options: ApplicationOptions) {
       return
     }
 
+    if (method === "GET" && url.pathname === "/api/change-reviews") {
+      sendJson(response, 200, {
+        items: changeReviewManager.list(url.searchParams.get("task_group_id") ?? undefined),
+      })
+      return
+    }
+
+    if (method === "GET" && url.pathname === "/api/job-watches") {
+      sendJson(response, 200, {
+        items: watchJobManager.list(url.searchParams.get("task_group_id") ?? undefined),
+      })
+      return
+    }
+
+    const jobWatchCancelMatch = url.pathname.match(/^\/api\/job-watches\/([^/]+)\/cancel$/)
+    if (method === "POST" && jobWatchCancelMatch !== null) {
+      sendJson(response, 200, watchJobManager.cancel(decodeURIComponent(jobWatchCancelMatch[1])))
+      return
+    }
+
+    const changeReviewDecisionMatch = url.pathname.match(/^\/api\/change-reviews\/([^/]+)\/decision$/)
+    if (method === "POST" && changeReviewDecisionMatch !== null) {
+      const body = await readJson(request, options.config.maxRequestBytes)
+      const review = await changeReviewManager.decide({
+        reviewId: decodeURIComponent(changeReviewDecisionMatch[1]),
+        decision: changeReviewDecision(body.decision),
+        rationale: typeof body.rationale === "string" && body.rationale.trim() !== "" ? body.rationale.trim() : undefined,
+      })
+      sendJson(response, 200, review)
+      return
+    }
+
     if (method === "GET" && url.pathname === "/api/audit") {
       const parsedLimit = Number(url.searchParams.get("limit") ?? "100")
       const limit = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, 500) : 100
@@ -264,19 +327,22 @@ export function createApplication(options: ApplicationOptions) {
       const session = await adapter.createSession({
         title,
         model: options.config.opencodeModel,
-        permission: mainSessionPermissionRules,
       })
       const approvalSession = await adapter.createSession({
         title: `${title} / 权限审批`,
         parentSessionId: session.id,
         model: options.config.opencodeModel,
-        permission: approverSessionPermissionRules,
       })
-      const created = store.createTaskGroup({ title, sessionId: session.id })
+      const created = store.createTaskGroup({
+        title,
+        sessionId: session.id,
+        agentName: options.config.mainAgentName,
+      })
       const approver = store.attachApprover({
         taskGroupId: created.taskGroup.id,
         parentAgentId: created.agent.id,
         sessionId: approvalSession.id,
+        agentName: options.config.approvalAgentName,
       })
       const result = { ...created, approver }
       events.publish("task_group.created", result)
@@ -304,7 +370,7 @@ export function createApplication(options: ApplicationOptions) {
         taskGroupId,
         callerSessionId: mainAgent.opencodeSessionId,
         requestId: typeof body.request_id === "string" && body.request_id !== "" ? body.request_id : randomUUID(),
-        tasks: workerTaskInputs(body.tasks),
+        tasks: workerTaskInputs(body.tasks, options.config.defaultWorkerAgentName),
       })
       sendJson(response, result.idempotent ? 200 : 201, result)
       return
@@ -326,7 +392,7 @@ export function createApplication(options: ApplicationOptions) {
         taskGroupId: caller.taskGroupId,
         callerSessionId,
         requestId: requiredString(body.request_id, "request_id"),
-        tasks: workerTaskInputs(body.tasks),
+        tasks: workerTaskInputs(body.tasks, options.config.defaultWorkerAgentName),
       })
       sendJson(response, result.idempotent ? 200 : 201, result)
       return
@@ -390,6 +456,76 @@ export function createApplication(options: ApplicationOptions) {
       return
     }
 
+    if (method === "POST" && url.pathname === "/internal/orchestrator/list-agent-types") {
+      if (options.config.toolToken !== undefined && request.headers["x-control-plane-token"] !== options.config.toolToken) {
+        sendError(response, 401, "INVALID_TOOL_TOKEN", "Invalid Control Plane tool token")
+        return
+      }
+      const body = await readJson(request, options.config.maxRequestBytes)
+      sendJson(response, 200, {
+        items: await communicationManager.listAgentTypes(requiredString(body.caller_session_id, "caller_session_id")),
+      })
+      return
+    }
+
+    if (method === "POST" && url.pathname === "/internal/orchestrator/list-active-agents") {
+      if (options.config.toolToken !== undefined && request.headers["x-control-plane-token"] !== options.config.toolToken) {
+        sendError(response, 401, "INVALID_TOOL_TOKEN", "Invalid Control Plane tool token")
+        return
+      }
+      const body = await readJson(request, options.config.maxRequestBytes)
+      sendJson(response, 200, {
+        items: communicationManager.listActiveAgents(requiredString(body.caller_session_id, "caller_session_id")),
+      })
+      return
+    }
+
+    if (method === "POST" && url.pathname === "/internal/orchestrator/diff-review") {
+      if (options.config.toolToken !== undefined && request.headers["x-control-plane-token"] !== options.config.toolToken) {
+        sendError(response, 401, "INVALID_TOOL_TOKEN", "Invalid Control Plane tool token")
+        return
+      }
+      const body = await readJson(request, options.config.maxRequestBytes)
+      const callerSessionId = requiredString(body.caller_session_id, "caller_session_id")
+      if (!Array.isArray(body.comparisons)) throw new Error("INVALID_DIFF_REVIEW_FILES")
+      const comparisons = body.comparisons.map((item, index) => {
+        if (item === null || typeof item !== "object" || Array.isArray(item)) throw new Error("INVALID_DIFF_REVIEW_FILE")
+        const comparison = item as Record<string, unknown>
+        return {
+          beforePath: requiredString(comparison.before_file, `comparisons_${index}_before_file`),
+          afterPath: requiredString(comparison.after_file, `comparisons_${index}_after_file`),
+          label: typeof comparison.label === "string" ? comparison.label : undefined,
+        }
+      })
+      const result = await changeReviewManager.review({
+        callerSessionId,
+        summary: requiredString(body.summary, "summary"),
+        comparisons,
+      })
+      sendJson(response, 200, result)
+      return
+    }
+
+    if (method === "POST" && url.pathname === "/internal/orchestrator/watch-job") {
+      if (options.config.toolToken !== undefined && request.headers["x-control-plane-token"] !== options.config.toolToken) {
+        sendError(response, 401, "INVALID_TOOL_TOKEN", "Invalid Control Plane tool token")
+        return
+      }
+      const body = await readJson(request, options.config.maxRequestBytes)
+      const result = watchJobManager.schedule({
+        callerSessionId: requiredString(body.caller_session_id, "caller_session_id"),
+        title: requiredString(body.title, "title"),
+        wakeMessage: requiredString(body.wake_message, "wake_message"),
+        delaySeconds: watchDelaySeconds(body.delay_seconds),
+        idempotencyKey:
+          typeof body.idempotency_key === "string" && body.idempotency_key.trim() !== ""
+            ? body.idempotency_key.trim()
+            : undefined,
+      })
+      sendJson(response, result.created ? 201 : 200, result)
+      return
+    }
+
     if (method === "POST" && url.pathname === "/internal/orchestrator/message-worker") {
       if (options.config.toolToken !== undefined && request.headers["x-control-plane-token"] !== options.config.toolToken) {
         sendError(response, 401, "INVALID_TOOL_TOKEN", "Invalid Control Plane tool token")
@@ -426,12 +562,32 @@ export function createApplication(options: ApplicationOptions) {
       }
 
       if (method === "GET") {
+        if (
+          agent.lifecycleStatus === "FAILED" &&
+          agent.lastError === "OpenCode Session was not found during startup recovery."
+        ) {
+          sendJson(response, 200, {
+            items: [],
+            agent,
+            warning: "这个 Agent 的 OpenCode Session 已失效。请新建一个 Agent Team 后继续对话。",
+          })
+          return
+        }
         const messages = await adapter.listMessages(agent.opencodeSessionId)
         sendJson(response, 200, { items: messages, agent, warning: emptyAssistantWarning(messages) })
         return
       }
 
       if (method === "POST") {
+        if (agent.lifecycleStatus === "FAILED") {
+          sendError(
+            response,
+            409,
+            "AGENT_SESSION_UNAVAILABLE",
+            "这个 Agent 的 OpenCode Session 已失效，请新建一个 Agent Team 后重试。",
+          )
+          return
+        }
         const body = await readJson(request, options.config.maxRequestBytes)
         const text = requiredString(body.text, "text")
         const runId = randomUUID()
@@ -441,12 +597,12 @@ export function createApplication(options: ApplicationOptions) {
           : agent.role === "WORKER"
             ? workerAgentSystem
             : approvalAgentSystem
-        const tools = agent.role === "MAIN"
-          ? mainAgentTools
-          : agent.role === "WORKER"
-            ? workerAgentTools
-            : approvalAgentTools
-        await adapter.sendAsync(agent.opencodeSessionId, { text, model: options.config.opencodeModel, system, tools })
+        await adapter.sendAsync(agent.opencodeSessionId, {
+          text,
+          agent: agent.opencodeAgentName,
+          model: options.config.opencodeModel,
+          system,
+        })
         events.publish("agent.message.accepted", { agentId, runId })
         sendJson(response, 202, { accepted: true, runId })
         return
@@ -462,7 +618,7 @@ export function createApplication(options: ApplicationOptions) {
         return
       }
       const aborted = await adapter.abortSession(agent.opencodeSessionId)
-      store.setAgentStatus(agent.id, "CANCELLED")
+      store.setAgentStatus(agent.id, "IDLE")
       events.publish("agent.aborted", { agentId, aborted })
       sendJson(response, 200, { aborted })
       return
@@ -582,14 +738,23 @@ export function createApplication(options: ApplicationOptions) {
     if (!requiredRoutesAvailable(capabilities)) {
       throw new Error(`OpenCode is missing required capabilities: ${JSON.stringify(capabilities.routes)}`)
     }
-    const sessions = await adapter.listSessions()
+    const [sessions, configuredAgents] = await Promise.all([adapter.listSessions(), adapter.listAgents()])
+    const configuredNames = new Set(configuredAgents.map((agent) => agent.name))
+    for (const name of [options.config.mainAgentName, options.config.approvalAgentName, options.config.defaultWorkerAgentName]) {
+      if (!configuredNames.has(name)) throw new Error(`OPENCODE_AGENT_NOT_FOUND: ${name}`)
+    }
+    const migratedAgents = store.migrateSystemAgentNames({
+      mainAgentName: options.config.mainAgentName,
+      approvalAgentName: options.config.approvalAgentName,
+    })
     recovery = store.recoverAgainstSessions(new Set(sessions.map((session) => session.id)))
     if (store.getStats().agents > 0) {
-      store.appendAudit({ type: "storage.recovered", data: { ...recovery } })
+      store.appendAudit({ type: "storage.recovered", data: { ...recovery, migratedAgents } })
     }
     if (capabilities.routes.permissionList && capabilities.routes.permissionReply) {
       await permissionManager.syncPending()
     }
+    watchJobManager.recover()
     initialized = true
   }
 
@@ -597,6 +762,8 @@ export function createApplication(options: ApplicationOptions) {
     server,
     store,
     permissionManager,
+    changeReviewManager,
+    watchJobManager,
     handleRequest: safeHandleRequest,
     get capabilities() {
       return capabilities
@@ -618,6 +785,7 @@ export function createApplication(options: ApplicationOptions) {
     async stop(): Promise<void> {
       if (stopping) return
       stopping = true
+      watchJobManager.stop()
       relayController.abort()
       events.close()
       server.closeAllConnections()

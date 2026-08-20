@@ -2,9 +2,11 @@
 
 ## 当前角色
 
-- `MAIN`：接收用户任务、创建 Worker、查询 Worker 状态、主动下发指导、回答 Worker 问题。
-- `WORKER`：完整独立的 OpenCode Session，可以由用户直接聊天并使用常规工具；禁用内置 `question`，改用 `ask_main_agent` 向主 Agent 求助。
-- `APPROVER`：每个 TaskGroup 自动创建一个独立审批 Session，只负责处理后端转发的权限审核。
+- `MAIN`：使用 `opencode.json` 中的 `control-plane-main` 原生 Agent，接收用户任务、创建 Worker、查询 Worker 状态、主动下发指导、回答 Worker 问题。
+- `WORKER`：完整独立的 OpenCode Session，默认使用 `control-plane-worker`，也可选择工作区里的其他原生命名 Agent。
+- `APPROVER`：每个 TaskGroup 自动创建一个独立审批 Session，使用 `permission-approver` 原生 Agent，只负责处理后端转发的权限审核。
+
+工具可见性与基础权限现在完全由这些 OpenCode Agent 的 `permission` 配置决定。Control Plane 通过请求中的 `agent` 名称选择定义，不再发送 Prompt 级 `tools`，也不再在创建 Session 时写入后端硬编码权限。
 
 ## 已完成链路
 
@@ -33,7 +35,7 @@
 5. Permission Manager 才是唯一真正回复 OpenCode permission API 的组件。
 6. `escalate` 留在页面权限中心等待用户；`always` 只能由用户选择。
 
-审批 Agent 的普通项目工具被禁用，Session 权限规则为默认拒绝、仅允许 `review_permission`。如果审批 Agent 自己产生额外权限请求，系统不会递归自审，而是直接等待人工。
+审批 Agent 的 OpenCode 配置为默认拒绝、仅允许 `review_permission`。如果审批 Agent 自己产生额外权限请求，系统不会递归自审，而是直接等待人工。
 
 ## 页面变化
 
@@ -52,8 +54,7 @@
 
 ## 验证
 
-- 14 项自动化测试全部通过。
-- 覆盖主/审批 Session 自动创建、Worker 工具配置、Worker 问答往返、主 Agent 主动监工、审批 Agent 路由、静态权限过滤、人工升级、SQLite 持久化和重启恢复。
+- 自动化测试覆盖主/审批 Session 自动创建、原生 Agent 选择、后端不覆盖工具配置、Worker 问答往返、主 Agent 主动监工、审批 Agent 路由、静态权限过滤、人工升级、SQLite 持久化和重启恢复。
 - 所有自定义工具文件均通过 Node 语法检查。
 
 ## 下一步建议

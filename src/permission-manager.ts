@@ -3,10 +3,9 @@ import type { EventHub } from "./event-hub.ts"
 import type {
   OpenCodeAdapter,
   OpenCodePermissionDecision,
-  OpenCodePermissionRule,
   OpenCodePermissionRequest,
 } from "./opencode-adapter.ts"
-import { approvalAgentSystem, approvalAgentTools } from "./agent-prompts.ts"
+import { approvalAgentSystem } from "./agent-prompts.ts"
 import {
   InMemoryStore,
   type AgentInstance,
@@ -16,24 +15,6 @@ import {
 } from "./store.ts"
 
 export type PermissionReview = "approve_once" | "reject" | "escalate"
-
-export const mainSessionPermissionRules: OpenCodePermissionRule[] = [
-  { permission: "*", pattern: "*", action: "ask" },
-  { permission: "spawn_workers", pattern: "*", action: "allow" },
-  { permission: "answer_worker", pattern: "*", action: "allow" },
-  { permission: "list_workers", pattern: "*", action: "allow" },
-  { permission: "message_worker", pattern: "*", action: "allow" },
-]
-
-export const workerSessionPermissionRules: OpenCodePermissionRule[] = [
-  { permission: "*", pattern: "*", action: "ask" },
-  { permission: "ask_main_agent", pattern: "*", action: "allow" },
-]
-
-export const approverSessionPermissionRules: OpenCodePermissionRule[] = [
-  { permission: "*", pattern: "*", action: "deny" },
-  { permission: "review_permission", pattern: "*", action: "allow" },
-]
 
 interface PolicyResult {
   risk: PermissionRisk
@@ -65,7 +46,7 @@ function evaluatePolicy(agent: AgentInstance, request: OpenCodePermissionRequest
   const details = permissionText(request)
   const destructive = [
     /\brm\s+[^\n]*(?:-rf|-fr|--recursive)/i,
-    /(^|\s)git\s+(?:push|reset\s+--hard|clean\s+-[a-z]*[fd])/i,
+    /(^|\s)git\s+(?:reset\s+--hard|clean\s+-[a-z]*[fd])/i,
     /\b(?:drop|truncate|delete\s+from|update\s+\S+\s+set|insert\s+into|alter\s+table)\b/i,
   ].some((pattern) => pattern.test(details))
 
@@ -234,7 +215,13 @@ export class PermissionManager {
 
     if (policy.decision !== undefined) {
       try {
-        return await this.decide(result.permission.id, policy.decision, "STATIC_POLICY", policy.rationale)
+        const resolved = await this.decide(
+          result.permission.id,
+          policy.decision,
+          "STATIC_POLICY",
+          policy.rationale,
+        )
+        return resolved
       } catch (error) {
         this.recordDecisionError(result.permission, error)
         return this.store.getPermissionRequest(result.permission.id)
@@ -351,9 +338,9 @@ export class PermissionManager {
     })
     try {
       await this.adapter.sendAsync(approver.opencodeSessionId, {
+        agent: approver.opencodeAgentName,
         model: this.config.opencodeModel,
         system: approvalAgentSystem,
-        tools: approvalAgentTools,
         text: [
           "An Agent is waiting for permission review.",
           `Control Plane permission ID: ${permission.id}`,

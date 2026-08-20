@@ -23,6 +23,7 @@ try {
   process.stdout.write(
     `Model: ${config.opencodeModel === undefined ? "OpenCode default" : `${config.opencodeModel.providerID}/${config.opencodeModel.modelID}`}\n`,
   )
+  process.stdout.write(`Team workspace: ${config.opencodeDirectory}\n`)
   process.stdout.write(`State database: ${config.databasePath}\n`)
 } catch (error) {
   process.stderr.write(`${formatStartupError(error, config)}\n`)

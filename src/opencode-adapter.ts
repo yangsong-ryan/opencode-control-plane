@@ -2,6 +2,7 @@ export interface OpenCodeCapabilities {
   healthy: boolean
   version: string
   routes: {
+    listAgents: boolean
     createSession: boolean
     listSessions: boolean
     listMessages: boolean
@@ -27,12 +28,21 @@ export interface OpenCodeMessage {
   parts: Array<Record<string, unknown>>
 }
 
+export interface OpenCodeAgentInfo {
+  name: string
+  description?: string
+  mode?: "primary" | "subagent" | "all"
+  hidden?: boolean
+  native?: boolean
+  model?: { providerID?: string; modelID?: string; id?: string } | string
+  [key: string]: unknown
+}
+
 export interface SendMessageInput {
   text: string
   agent?: string
   model?: { providerID: string; modelID: string }
   system?: string
-  tools?: Record<string, boolean>
 }
 
 export type OpenCodePermissionDecision = "once" | "always" | "reject"
@@ -213,6 +223,7 @@ export class OpenCodeAdapter {
       healthy: health.healthy === true,
       version: health.version ?? "unknown",
       routes: {
+        listAgents: routeExists(specText, "get", ["/agent", "/api/agent"]),
         createSession: routeExists(specText, "post", ["/session"]),
         listSessions: routeExists(specText, "get", ["/session"]),
         listMessages: routeExists(specText, "get", [
@@ -268,6 +279,18 @@ export class OpenCodeAdapter {
     return (await response.json()) as OpenCodeSession[]
   }
 
+  async listAgents(): Promise<OpenCodeAgentInfo[]> {
+    try {
+      const response = await this.request("/agent")
+      return (await response.json()) as OpenCodeAgentInfo[]
+    } catch (error) {
+      if (!(error instanceof OpenCodeHttpError) || error.status !== 404) throw error
+      const response = await this.request("/api/agent")
+      const body = (await response.json()) as OpenCodeAgentInfo[] | { data?: OpenCodeAgentInfo[] }
+      return Array.isArray(body) ? body : body.data ?? []
+    }
+  }
+
   async listMessages(sessionId: string): Promise<OpenCodeMessage[]> {
     const response = await this.request(`/session/${encodeURIComponent(sessionId)}/message`)
     return (await response.json()) as OpenCodeMessage[]
@@ -281,7 +304,6 @@ export class OpenCodeAdapter {
         agent: input.agent,
         model: input.model,
         system: input.system,
-        tools: input.tools,
         parts: [{ type: "text", text: input.text }],
       }),
     })

@@ -3,12 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A minimal control plane for managing OpenCode sessions.",
+  "description": "An OpenCode Agent Teams control plane with independent worker sessions, permission routing, diff review, watch jobs, and a web workspace.",
   "scripts": {
     "doctor": "node src/doctor.ts",
     "dev": "node --watch src/index.ts",
     "start": "node src/index.ts",
-    "test": "node --test --test-reporter=spec tests/*.test.ts"
+    "test": "node --test --test-reporter=spec tests/*.test.ts",
+    "verify:agents": "node scripts/verify-opencode-agents.ts"
   },
   "engines": {
     "node": ">=24"

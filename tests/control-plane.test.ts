@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { once } from "node:events"
@@ -12,6 +12,7 @@ import { EventHub } from "../src/event-hub.ts"
 import {
   OpenCodeAdapter,
   OpenCodeConnectionError,
+  type OpenCodeAgentInfo,
   type OpenCodeCapabilities,
   type OpenCodeMessage,
   type OpenCodePermissionDecision,
@@ -92,6 +93,13 @@ class FakeAdapter {
   maxActiveCreates = 0
   private nextSession = 1
   private readonly createDelayMs: number
+  readonly agents: OpenCodeAgentInfo[] = [
+    { name: "build", description: "Default build Agent", mode: "primary", native: true },
+    { name: "control-plane-main", description: "Control Plane main Agent", mode: "primary", hidden: true, native: false },
+    { name: "permission-approver", description: "Permission approver", mode: "primary", hidden: true, native: false },
+    { name: "control-plane-worker", description: "Generic Control Plane Worker", mode: "primary", native: false },
+    { name: "sql-investigator", description: "Investigate SQL data", mode: "subagent", native: false },
+  ]
 
   constructor(createDelayMs = 0) {
     this.createDelayMs = createDelayMs
@@ -107,6 +115,7 @@ class FakeAdapter {
       healthy: true,
       version: "1.17.15-test",
       routes: {
+        listAgents: true,
         createSession: true,
         listSessions: true,
         listMessages: true,
@@ -142,6 +151,10 @@ class FakeAdapter {
 
   async listSessions(): Promise<OpenCodeSession[]> {
     return [...this.sessions]
+  }
+
+  async listAgents(): Promise<OpenCodeAgentInfo[]> {
+    return [...this.agents]
   }
 
   async listMessages(sessionId: string): Promise<OpenCodeMessage[]> {
@@ -187,6 +200,9 @@ const config: ControlPlaneConfig = {
   opencodeBaseUrl: "http://opencode.test",
   opencodeDirectory: "/test/project",
   opencodeModel: { providerID: "test-provider", modelID: "test-model" },
+  mainAgentName: "control-plane-main",
+  approvalAgentName: "permission-approver",
+  defaultWorkerAgentName: "control-plane-worker",
   maxConcurrentWorkers: 2,
   maxRequestBytes: 100_000,
   databasePath: ":memory:",
@@ -211,6 +227,7 @@ test("OpenCodeAdapter probes routes and sends the exact legacy request shapes", 
   const spec = {
     openapi: "3.1.0",
     paths: {
+      "/agent": { get: {} },
       "/session": { get: {}, post: {} },
       "/session/{sessionID}/message": { get: {} },
       "/session/{sessionID}/prompt_async": { post: {} },
@@ -229,6 +246,9 @@ test("OpenCodeAdapter probes routes and sends the exact legacy request shapes", 
       return Response.json({ healthy: true, version: "1.17.15-test" })
     }
     if (url.pathname === "/doc") return Response.json(spec)
+    if (url.pathname === "/agent") {
+      return Response.json([{ name: "build", description: "Default build Agent", mode: "primary", native: true }])
+    }
     if (url.pathname === "/session" && init.method === "POST") {
       return Response.json({ id: "ses_1", title: "main" })
     }
@@ -268,6 +288,7 @@ test("OpenCodeAdapter probes routes and sends the exact legacy request shapes", 
 
   const capabilities = await adapter.probeCapabilities()
   assert.equal(capabilities.version, "1.17.15-test")
+  assert.equal(capabilities.routes.listAgents, true)
   assert.equal(capabilities.routes.v2PermissionReply, true)
   assert.equal(capabilities.routes.listSessions, true)
   assert.equal(capabilities.routes.permissionList, true)
@@ -275,8 +296,14 @@ test("OpenCodeAdapter probes routes and sends the exact legacy request shapes", 
 
   assert.equal((await adapter.createSession({ title: "main" })).id, "ses_1")
   assert.equal((await adapter.listSessions()).length, 1)
+  assert.equal((await adapter.listAgents())[0]?.name, "build")
   assert.equal((await adapter.listMessages("ses_1")).length, 1)
-  await adapter.sendAsync("ses_1", { text: "检查广告费" })
+  await adapter.sendAsync("ses_1", {
+    text: "检查广告费",
+    agent: "control-plane-main",
+    model: { providerID: "ali", modelID: "qwen3-coder-plus" },
+    system: "DYNAMIC_MAIN_SYSTEM_PROMPT",
+  })
   assert.equal(await adapter.abortSession("ses_1"), true)
   assert.deepEqual(await adapter.listPendingPermissions(), [])
   await adapter.replyPermission({ sessionId: "ses_1", requestId: "per_1", decision: "once" })
@@ -293,9 +320,15 @@ test("OpenCodeAdapter probes routes and sends the exact legacy request shapes", 
 
   const promptRequest = requests.find((request) => request.url.pathname.endsWith("/prompt_async"))
   assert.ok(promptRequest)
-  assert.deepEqual(JSON.parse(String(promptRequest.init.body)), {
+  const promptBody = JSON.parse(String(promptRequest.init.body)) as Record<string, unknown>
+  assert.deepEqual(promptBody, {
+    agent: "control-plane-main",
+    model: { providerID: "ali", modelID: "qwen3-coder-plus" },
+    system: "DYNAMIC_MAIN_SYSTEM_PROMPT",
     parts: [{ type: "text", text: "检查广告费" }],
   })
+  assert.equal(Object.hasOwn(promptBody, "tools"), false)
+  assert.equal(Object.hasOwn(promptBody, "permission"), false)
   const promptHeaders = promptRequest.init.headers as Headers
   assert.match(promptHeaders.get("authorization") ?? "", /^Basic /)
 
@@ -344,18 +377,20 @@ test("Control Plane creates main and dedicated approval sessions", async () => {
   assert.equal(created.statusCode, 201)
   const body = created.json as {
     taskGroup: { id: string; rootAgentId: string }
-    agent: { id: string; opencodeSessionId: string }
-    approver: { id: string; role: string; opencodeSessionId: string; parentAgentId: string }
+    agent: { id: string; opencodeSessionId: string; opencodeAgentName: string }
+    approver: { id: string; role: string; opencodeSessionId: string; parentAgentId: string; opencodeAgentName: string }
   }
   assert.equal(body.agent.id, body.taskGroup.rootAgentId)
   assert.equal(body.agent.opencodeSessionId, "ses_1")
+  assert.equal(body.agent.opencodeAgentName, "control-plane-main")
   assert.equal(adapter.sessions[0]?.title, "商品损益排查")
-  assert.deepEqual(adapter.sessionInputs[0]?.permission?.[0], { permission: "*", pattern: "*", action: "ask" })
+  assert.equal(adapter.sessionInputs[0]?.permission, undefined)
   assert.equal(body.approver.role, "APPROVER")
   assert.equal(body.approver.opencodeSessionId, "ses_2")
   assert.equal(body.approver.parentAgentId, body.agent.id)
+  assert.equal(body.approver.opencodeAgentName, "permission-approver")
   assert.equal(adapter.sessions[1]?.parentID, "ses_1")
-  assert.deepEqual(adapter.sessionInputs[1]?.permission?.[0], { permission: "*", pattern: "*", action: "deny" })
+  assert.equal(adapter.sessionInputs[1]?.permission, undefined)
 
   const details = await inject(application, "GET", `/api/task-groups/${body.taskGroup.id}`)
   assert.equal(details.statusCode, 200)
@@ -377,7 +412,13 @@ test("root path presents a useful service page instead of a 404", async () => {
   assert.match(response.text, /SQLite/)
   assert.match(response.text, /工具调用/)
   assert.match(response.text, /setInterval\(refreshWorkspace,1500\)/)
-  assert.match(response.text, />停止</)
+  assert.match(response.text, />停止本轮</)
+  assert.match(response.text, /权限记录/)
+  assert.match(response.text, /renderMarkdown/)
+  assert.match(response.text, /chatFollow/)
+  assert.match(response.text, /distance<=24/)
+  assert.match(response.text, /isActivelyWaiting/)
+  assert.match(response.text, /return null/)
   const script = response.text.match(/<script>([\s\S]+)<\/script>/)?.[1]
   assert.ok(script)
   assert.doesNotThrow(() => new Function(script))
@@ -394,6 +435,29 @@ test("project OpenCode model becomes the explicit Control Plane model", () => {
   }
 })
 
+test("default deployment separates backend state from the bundled team workspace", () => {
+  const loaded = loadConfig({})
+  assert.equal(loaded.opencodeDirectory, join(process.cwd(), "workspace-template"))
+  assert.equal(loaded.databasePath, join(process.cwd(), ".data", "opencode-control-plane.sqlite"))
+})
+
+test("project OpenCode config owns Agent tool visibility and permissions", () => {
+  const projectConfig = JSON.parse(readFileSync(join(process.cwd(), "workspace-template", "opencode.json"), "utf8")) as {
+    agent: Record<string, { prompt?: string; permission: Record<string, string> }>
+  }
+  const main = projectConfig.agent["control-plane-main"]
+  const approver = projectConfig.agent["permission-approver"]
+  const worker = projectConfig.agent["control-plane-worker"]
+  assert.match(main?.prompt ?? "", /NATIVE_MAIN_PROMPT_V1/)
+  assert.match(approver?.prompt ?? "", /NATIVE_APPROVER_PROMPT_V1/)
+  assert.match(worker?.prompt ?? "", /NATIVE_WORKER_PROMPT_V1/)
+  assert.equal(main?.permission.spawn_workers, "allow")
+  assert.equal(approver?.permission["*"], "deny")
+  assert.equal(approver?.permission.review_permission, "allow")
+  assert.equal(worker?.permission.question, "deny")
+  assert.equal(worker?.permission.ask_main_agent, "allow")
+})
+
 test("Control Plane sends prompts, returns history, and aborts a main agent", async () => {
   const adapter = new FakeAdapter()
   const application = createApplication({ config, adapter: adapter as unknown as OpenCodeAdapter })
@@ -405,9 +469,10 @@ test("Control Plane sends prompts, returns history, and aborts a main agent", as
   assert.equal((prompt.json as { accepted: boolean }).accepted, true)
   assert.equal(adapter.prompts[0]?.sessionId, "ses_1")
   assert.equal(adapter.prompts[0]?.input.text, "检查广告费")
+  assert.equal(adapter.prompts[0]?.input.agent, "control-plane-main")
   assert.deepEqual(adapter.prompts[0]?.input.model, { providerID: "test-provider", modelID: "test-model" })
   assert.match(adapter.prompts[0]?.input.system ?? "", /spawn_workers/)
-  assert.equal(adapter.prompts[0]?.input.tools?.answer_worker, true)
+  assert.equal(Object.hasOwn(adapter.prompts[0]?.input ?? {}, "tools"), false)
 
   const history = await inject(application, "GET", `/api/agents/${agent.id}/messages`)
   assert.equal(history.statusCode, 200)
@@ -417,6 +482,11 @@ test("Control Plane sends prompts, returns history, and aborts a main agent", as
   assert.equal(abort.statusCode, 200)
   assert.deepEqual(abort.json, { aborted: true })
   assert.equal(adapter.abortCount, 1)
+  const groupAfterAbort = await inject(application, "GET", "/api/task-groups")
+  const abortedAgent = (groupAfterAbort.json as {
+    items: Array<{ agents: Array<{ id: string; lifecycleStatus: string }> }>
+  }).items[0]?.agents.find((item) => item.id === agent.id)
+  assert.equal(abortedAgent?.lifecycleStatus, "IDLE")
 })
 
 test("message history exposes model failures and the current Agent state", async () => {
@@ -444,6 +514,87 @@ test("message history exposes model failures and the current Agent state", async
   assert.equal(body.agent?.id, agent.id)
 })
 
+test("a trailing empty assistant envelope does not hide a valid model reply", async () => {
+  class TrailingEnvelopeAdapter extends FakeAdapter {
+    override async listMessages(sessionId: string): Promise<OpenCodeMessage[]> {
+      return [
+        { info: { id: "msg_user", sessionID: sessionId, role: "user" }, parts: [{ type: "text", text: "检查" }] },
+        { info: { id: "msg_answer", sessionID: sessionId, role: "assistant" }, parts: [{ type: "text", text: "检查完成" }] },
+        { info: { id: "msg_envelope", sessionID: sessionId, role: "assistant", tokens: { output: 0 } }, parts: [] },
+      ]
+    }
+  }
+  const application = createApplication({ config, adapter: new TrailingEnvelopeAdapter() as unknown as OpenCodeAdapter })
+  const created = await inject(application, "POST", "/api/task-groups", { title: "空消息误报测试" })
+  const { agent } = created.json as { agent: { id: string } }
+  const history = await inject(application, "GET", `/api/agents/${agent.id}/messages`)
+  assert.equal((history.json as { warning?: string }).warning, undefined)
+})
+
+test("an unfinished streaming assistant envelope does not produce a false empty-model warning", async () => {
+  class StreamingEnvelopeAdapter extends FakeAdapter {
+    override async listMessages(sessionId: string): Promise<OpenCodeMessage[]> {
+      return [
+        { info: { id: "msg_user", sessionID: sessionId, role: "user" }, parts: [{ type: "text", text: "检查" }] },
+        { info: { id: "msg_streaming", sessionID: sessionId, role: "assistant", tokens: { output: 0 } }, parts: [] },
+      ]
+    }
+  }
+  const application = createApplication({ config, adapter: new StreamingEnvelopeAdapter() as unknown as OpenCodeAdapter })
+  const created = await inject(application, "POST", "/api/task-groups", { title: "流式空消息测试" })
+  const { agent } = created.json as { agent: { id: string } }
+  const history = await inject(application, "GET", `/api/agents/${agent.id}/messages`)
+  assert.equal((history.json as { warning?: string }).warning, undefined)
+})
+
+test("a completed zero-token assistant response still reports the real model problem", async () => {
+  class CompletedEmptyAdapter extends FakeAdapter {
+    override async listMessages(sessionId: string): Promise<OpenCodeMessage[]> {
+      return [
+        { info: { id: "msg_user", sessionID: sessionId, role: "user" }, parts: [{ type: "text", text: "检查" }] },
+        {
+          info: {
+            id: "msg_empty",
+            sessionID: sessionId,
+            role: "assistant",
+            time: { completed: Date.now() },
+            finish: "stop",
+            tokens: { output: 0 },
+          },
+          parts: [],
+        },
+      ]
+    }
+  }
+  const application = createApplication({ config, adapter: new CompletedEmptyAdapter() as unknown as OpenCodeAdapter })
+  const created = await inject(application, "POST", "/api/task-groups", { title: "真实空响应测试" })
+  const { agent } = created.json as { agent: { id: string } }
+  const history = await inject(application, "GET", `/api/agents/${agent.id}/messages`)
+  assert.match((history.json as { warning?: string }).warning ?? "", /零 token|空内容/)
+})
+
+test("a recovered Agent with a missing OpenCode Session cannot enter a fake running state", async () => {
+  const adapter = new FakeAdapter()
+  const application = createApplication({ config, adapter: adapter as unknown as OpenCodeAdapter })
+  const created = await inject(application, "POST", "/api/task-groups", { title: "失效 Session 测试" })
+  const { agent } = created.json as { agent: { id: string } }
+  application.store.setAgentStatus(
+    agent.id,
+    "FAILED",
+    "OpenCode Session was not found during startup recovery.",
+  )
+
+  const history = await inject(application, "GET", "/api/agents/" + agent.id + "/messages")
+  assert.equal(history.statusCode, 200)
+  assert.match((history.json as { warning?: string }).warning ?? "", /Session 已失效/)
+
+  const sent = await inject(application, "POST", "/api/agents/" + agent.id + "/messages", { text: "你好" })
+  assert.equal(sent.statusCode, 409)
+  assert.equal((sent.json as { error: { code: string } }).error.code, "AGENT_SESSION_UNAVAILABLE")
+  assert.equal(application.store.getAgent(agent.id)?.lifecycleStatus, "FAILED")
+  assert.equal(adapter.prompts.length, 0)
+})
+
 test("spawns independent child sessions in a batch and deduplicates retries", async () => {
   const adapter = new FakeAdapter()
   const application = createApplication({ config, adapter: adapter as unknown as OpenCodeAdapter })
@@ -455,8 +606,8 @@ test("spawns independent child sessions in a batch and deduplicates retries", as
   const batch = {
     request_id: "batch-001",
     tasks: [
-      { field_key: "ads", title: "广告费", prompt: "检查广告费" },
-      { field_key: "shipping", title: "履约费", prompt: "检查履约费" },
+      { agent_name: "sql-investigator", field_key: "ads", title: "广告费", prompt: "检查广告费" },
+      { agent_name: "build", field_key: "shipping", title: "履约费", prompt: "检查履约费" },
     ],
   }
 
@@ -473,10 +624,11 @@ test("spawns independent child sessions in a batch and deduplicates retries", as
   assert.ok(firstBody.agents.every((worker) => worker.role === "WORKER"))
   assert.ok(firstBody.agents.every((worker) => worker.parentAgentId === mainAgent.id))
   assert.deepEqual(adapter.sessions.slice(2).map((session) => session.parentID), ["ses_1", "ses_1"])
-  assert.ok(adapter.sessionInputs.slice(2).every((input) => input.permission?.[0]?.action === "ask"))
+  assert.ok(adapter.sessionInputs.slice(2).every((input) => input.permission === undefined))
+  assert.deepEqual(adapter.prompts.map((prompt) => prompt.input.agent), ["sql-investigator", "build"])
   assert.deepEqual(adapter.prompts.map((prompt) => prompt.input.text), ["检查广告费", "检查履约费"])
-  assert.ok(adapter.prompts.every((prompt) => prompt.input.tools?.question === false))
-  assert.ok(adapter.prompts.every((prompt) => prompt.input.tools?.ask_main_agent === true))
+  assert.ok(adapter.prompts.every((prompt) => !Object.hasOwn(prompt.input, "tools")))
+  assert.ok(adapter.prompts.every((prompt) => /ask_main_agent/.test(prompt.input.system ?? "")))
 
   const repeated = await inject(application, "POST", `/api/task-groups/${taskGroup.id}/workers`, batch)
   assert.equal(repeated.statusCode, 200)
@@ -487,6 +639,12 @@ test("spawns independent child sessions in a batch and deduplicates retries", as
   const groupBody = group.json as { agents: unknown[]; workerTasks: unknown[] }
   assert.equal(groupBody.agents.length, 4)
   assert.equal(groupBody.workerTasks.length, 2)
+
+  const unknownType = await inject(application, "POST", `/api/task-groups/${taskGroup.id}/workers`, {
+    request_id: "unknown-agent-type",
+    tasks: [{ agent_name: "missing-agent", field_key: "missing", title: "不存在", prompt: "不会执行" }],
+  })
+  assert.equal(unknownType.statusCode, 404)
 })
 
 test("worker creation respects the configured concurrency limit", async () => {
@@ -587,7 +745,10 @@ test("ambiguous permissions route directly to the dedicated approval Agent", asy
   const pending = (pendingResponse.json as { items: Array<{ id: string; reviewRequested: boolean }> }).items[0]
   assert.equal(pending.reviewRequested, true)
   assert.equal(adapter.prompts.some((prompt) => prompt.sessionId === main.opencodeSessionId && /review_permission/.test(prompt.input.system ?? "")), false)
-  assert.ok(adapter.prompts.some((prompt) => prompt.sessionId === approver.opencodeSessionId && /review_permission/.test(prompt.input.system ?? "")))
+  const approvalPrompt = adapter.prompts.find((prompt) => prompt.sessionId === approver.opencodeSessionId && /review_permission/.test(prompt.input.system ?? ""))
+  assert.ok(approvalPrompt)
+  assert.equal(approvalPrompt.input.agent, "permission-approver")
+  assert.equal(Object.hasOwn(approvalPrompt.input, "tools"), false)
 
   const recommendation = await inject(application, "POST", "/internal/orchestrator/permission-reviews", {
     caller_session_id: approver.opencodeSessionId,
@@ -660,13 +821,255 @@ test("workers ask the main Agent and receive an answer in their own session", as
     caller_session_id: main.opencodeSessionId,
   })
   assert.equal((listed.json as { items: unknown[] }).items.length, 1)
+  const agentTypes = await inject(application, "POST", "/internal/orchestrator/list-agent-types", {
+    caller_session_id: main.opencodeSessionId,
+  })
+  assert.deepEqual(
+    (agentTypes.json as { items: Array<{ name: string }> }).items.map((item) => item.name),
+    ["build", "control-plane-worker", "sql-investigator"],
+  )
+  const activeAgents = await inject(application, "POST", "/internal/orchestrator/list-active-agents", {
+    caller_session_id: main.opencodeSessionId,
+  })
+  assert.equal((activeAgents.json as { items: unknown[] }).items.length, 1)
   const messaged = await inject(application, "POST", "/internal/orchestrator/message-worker", {
     caller_session_id: main.opencodeSessionId,
     worker_agent_id: worker.id,
     message: "再补充最近七天的样本。",
   })
   assert.equal(messaged.statusCode, 202)
-  assert.ok(adapter.prompts.some((prompt) => prompt.sessionId === worker.opencodeSessionId && /最近七天/.test(prompt.input.text)))
+  const followUp = adapter.prompts.find(
+    (prompt) => prompt.sessionId === worker.opencodeSessionId && /最近七天/.test(prompt.input.text),
+  )
+  assert.ok(followUp)
+  assert.equal(followUp.input.agent, "control-plane-worker")
+})
+
+test("complete team flow keeps every role in one workspace-scoped OpenCode runtime", async () => {
+  const adapter = new FakeAdapter()
+  const application = createApplication({ config, adapter: adapter as unknown as OpenCodeAdapter })
+
+  const created = await inject(application, "POST", "/api/task-groups", { title: "完整流程验证" })
+  const { taskGroup, agent: main, approver } = created.json as {
+    taskGroup: { id: string }
+    agent: { id: string; opencodeSessionId: string; opencodeAgentName: string }
+    approver: { opencodeSessionId: string; opencodeAgentName: string }
+  }
+  assert.equal(main.opencodeAgentName, "control-plane-main")
+  assert.equal(approver.opencodeAgentName, "permission-approver")
+
+  const mainMessage = await inject(application, "POST", `/api/agents/${main.id}/messages`, {
+    text: "检查费用口径，必要时创建 Worker。",
+  })
+  assert.equal(mainMessage.statusCode, 202)
+  assert.equal(adapter.prompts.at(-1)?.input.agent, "control-plane-main")
+
+  const types = await inject(application, "POST", "/internal/orchestrator/list-agent-types", {
+    caller_session_id: main.opencodeSessionId,
+  })
+  assert.ok((types.json as { items: Array<{ name: string }> }).items.some((item) => item.name === "control-plane-worker"))
+
+  const spawned = await inject(application, "POST", `/api/task-groups/${taskGroup.id}/workers`, {
+    request_id: "complete-flow-worker",
+    tasks: [{ field_key: "shipping", title: "履约费用", prompt: "核对履约费用口径" }],
+  })
+  assert.equal(spawned.statusCode, 201)
+  const worker = (spawned.json as {
+    agents: Array<{ id: string; opencodeSessionId: string; opencodeAgentName: string }>
+  }).agents[0]
+  assert.equal(worker.opencodeAgentName, "control-plane-worker")
+
+  const directWorkerMessage = await inject(application, "POST", `/api/agents/${worker.id}/messages`, {
+    text: "补充检查最近七天。",
+  })
+  assert.equal(directWorkerMessage.statusCode, 202)
+  assert.equal(adapter.prompts.at(-1)?.input.agent, "control-plane-worker")
+
+  const asked = await inject(application, "POST", "/internal/orchestrator/ask-main", {
+    caller_session_id: worker.opencodeSessionId,
+    question: "使用含税还是未税口径？",
+  })
+  const question = asked.json as { id: string }
+  const answered = await inject(application, "POST", "/internal/orchestrator/answer-worker", {
+    caller_session_id: main.opencodeSessionId,
+    question_id: question.id,
+    answer: "使用含税口径。",
+  })
+  assert.equal(answered.statusCode, 200)
+
+  const readPermission = await application.permissionManager.ingest({
+    id: "complete_flow_read",
+    sessionID: worker.opencodeSessionId,
+    permission: "read",
+    patterns: ["docs/口径.md"],
+  })
+  assert.equal(readPermission?.decisionSource, "STATIC_POLICY")
+  assert.equal(readPermission?.status, "APPROVED")
+
+  const unknownPermission = await application.permissionManager.ingest({
+    id: "complete_flow_unknown",
+    sessionID: worker.opencodeSessionId,
+    permission: "finance_query",
+    patterns: ["shipping_cost"],
+  })
+  assert.equal(unknownPermission?.status, "PENDING")
+  assert.equal(adapter.prompts.at(-1)?.sessionId, approver.opencodeSessionId)
+  assert.equal(adapter.prompts.at(-1)?.input.agent, "permission-approver")
+  const approved = await inject(application, "POST", "/internal/orchestrator/permission-reviews", {
+    caller_session_id: approver.opencodeSessionId,
+    permission_id: unknownPermission?.id,
+    review: "approve_once",
+    reason: "范围明确的单字段只读查询。",
+  })
+  assert.equal((approved.json as { status: string }).status, "APPROVED")
+
+  const watch = await inject(application, "POST", "/internal/orchestrator/watch-job", {
+    caller_session_id: worker.opencodeSessionId,
+    title: "等待线上查询",
+    delay_seconds: 60,
+    wake_message: "查询履约费用任务状态并继续。",
+    idempotency_key: "complete-flow-watch",
+  })
+  const wakeAt = (watch.json as { watch: { wakeAt: string } }).watch.wakeAt
+  assert.equal(await application.watchJobManager.deliverDue(Date.parse(wakeAt)), 1)
+  assert.equal(adapter.prompts.at(-1)?.sessionId, worker.opencodeSessionId)
+  assert.equal(adapter.prompts.at(-1)?.input.agent, "control-plane-worker")
+
+  const details = await inject(application, "GET", `/api/task-groups/${taskGroup.id}`)
+  const detailBody = details.json as { agents: unknown[]; agentQuestions: Array<{ status: string }> }
+  assert.equal(detailBody.agents.length, 3)
+  assert.equal(detailBody.agentQuestions[0]?.status, "ANSWERED")
+  application.watchJobManager.stop()
+})
+
+test("diff review blocks the tool call until the user approves or rejects the real file diff", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "opencode-diff-review-"))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  writeFileSync(join(directory, "example.before.ts"), "export const value = 1\n")
+  writeFileSync(join(directory, "example.after.ts"), "export const value = 2\nexport const enabled = true\n")
+  const adapter = new FakeAdapter()
+  const application = createApplication({
+    config: { ...config, opencodeDirectory: directory },
+    adapter: adapter as unknown as OpenCodeAdapter,
+  })
+  const created = await inject(application, "POST", "/api/task-groups", { title: "代码修改审查" })
+  const main = (created.json as { agent: { opencodeSessionId: string } }).agent
+
+  const pendingRejection = inject(application, "POST", "/internal/orchestrator/diff-review", {
+    caller_session_id: main.opencodeSessionId,
+    summary: "调整示例值",
+    comparisons: [{ before_file: "example.before.ts", after_file: "example.after.ts", label: "example.ts" }],
+  })
+  while (application.changeReviewManager.list().length === 0) await new Promise((resolve) => setTimeout(resolve, 1))
+  const first = application.changeReviewManager.list()[0]
+  assert.equal(first.additions, 2)
+  assert.equal(first.deletions, 1)
+  assert.match(first.files[0]?.diff ?? "", /\+export const enabled = true/)
+  assert.deepEqual(first.files[0]?.rows, [
+    {
+      kind: "modified",
+      beforeLine: 1,
+      afterLine: 1,
+      beforeText: "export const value = 1",
+      afterText: "export const value = 2",
+    },
+    {
+      kind: "added",
+      beforeLine: undefined,
+      afterLine: 2,
+      beforeText: undefined,
+      afterText: "export const enabled = true",
+    },
+  ])
+
+  const rejected = await inject(application, "POST", `/api/change-reviews/${first.id}/decision`, {
+    decision: "reject",
+    rationale: "开关名称需要更明确",
+  })
+  assert.equal((rejected.json as { status: string }).status, "REJECTED")
+  const rejectedResult = await pendingRejection
+  assert.deepEqual(rejectedResult.json, {
+    result: "rejected",
+    reviewId: first.id,
+    reason: "开关名称需要更明确",
+  })
+
+  writeFileSync(join(directory, "example.after.ts"), "export const value = 2\nexport const featureEnabled = true\n")
+  const pendingApproval = inject(application, "POST", "/internal/orchestrator/diff-review", {
+    caller_session_id: main.opencodeSessionId,
+    summary: "按意见调整开关名称",
+    comparisons: [{ before_file: "example.before.ts", after_file: "example.after.ts", label: "example.ts" }],
+  })
+  while (application.changeReviewManager.list().length < 2) await new Promise((resolve) => setTimeout(resolve, 1))
+  const second = application.changeReviewManager.list()[0]
+  const approved = await inject(application, "POST", `/api/change-reviews/${second.id}/decision`, {
+    decision: "approve",
+  })
+  assert.equal((approved.json as { status: string }).status, "APPROVED")
+  const approvedResult = await pendingApproval
+  assert.deepEqual(approvedResult.json, { result: "ok", reviewId: second.id })
+  assert.equal(adapter.prompts.some((prompt) => /Human (?:approved|rejected) change review/.test(prompt.input.text)), false)
+})
+
+test("watch_job persists a delayed wake-up and resumes the same Agent Session", async () => {
+  const adapter = new FakeAdapter()
+  const application = createApplication({ config, adapter: adapter as unknown as OpenCodeAdapter })
+  const created = await inject(application, "POST", "/api/task-groups", { title: "长任务监控" })
+  const { taskGroup, agent } = created.json as {
+    taskGroup: { id: string }
+    agent: { id: string; opencodeSessionId: string }
+  }
+
+  const scheduled = await inject(application, "POST", "/internal/orchestrator/watch-job", {
+    caller_session_id: agent.opencodeSessionId,
+    title: "线上报表生成",
+    delay_seconds: 60,
+    wake_message: "查询 job-2026 的运行状态；成功后读取结果并汇总。",
+    idempotency_key: "job-2026-first-check",
+  })
+  assert.equal(scheduled.statusCode, 201)
+  const body = scheduled.json as {
+    created: boolean
+    watch: { id: string; wakeAt: string; status: string; opencodeSessionId: string }
+  }
+  assert.equal(body.created, true)
+  assert.equal(body.watch.status, "SCHEDULED")
+  assert.equal(body.watch.opencodeSessionId, agent.opencodeSessionId)
+
+  const duplicate = await inject(application, "POST", "/internal/orchestrator/watch-job", {
+    caller_session_id: agent.opencodeSessionId,
+    title: "不会重复创建",
+    delay_seconds: 120,
+    wake_message: "不会替换第一次登记的内容",
+    idempotency_key: "job-2026-first-check",
+  })
+  assert.equal(duplicate.statusCode, 200)
+  assert.equal((duplicate.json as { created: boolean }).created, false)
+
+  assert.equal(await application.watchJobManager.deliverDue(Date.parse(body.watch.wakeAt)), 1)
+  assert.equal(adapter.prompts.length, 1)
+  assert.equal(adapter.prompts[0]?.sessionId, agent.opencodeSessionId)
+  assert.match(adapter.prompts[0]?.input.text ?? "", /job-2026/)
+  assert.match(adapter.prompts[0]?.input.text ?? "", /查询外部任务的真实状态/)
+  assert.equal(adapter.prompts[0]?.input.agent, "control-plane-main")
+  assert.equal(Object.hasOwn(adapter.prompts[0]?.input ?? {}, "tools"), false)
+
+  const listed = await inject(application, "GET", `/api/job-watches?task_group_id=${taskGroup.id}`)
+  const watches = (listed.json as { items: Array<{ id: string; status: string }> }).items
+  assert.equal(watches.length, 1)
+  assert.equal(watches[0]?.id, body.watch.id)
+  assert.equal(watches[0]?.status, "DELIVERED")
+
+  const cancellable = application.watchJobManager.schedule({
+    callerSessionId: agent.opencodeSessionId,
+    title: "可取消检查",
+    wakeMessage: "不应发送",
+    delaySeconds: 60,
+  }).watch
+  const cancelled = await inject(application, "POST", `/api/job-watches/${cancellable.id}/cancel`)
+  assert.equal((cancelled.json as { status: string }).status, "CANCELLED")
+  assert.equal(await application.watchJobManager.deliverDue(Date.parse(cancellable.wakeAt)), 0)
+  application.watchJobManager.stop()
 })
 
 test("SQLite store persists task groups, workers, permissions, audit, and idempotency keys", (t) => {
@@ -684,13 +1087,14 @@ test("SQLite store persists task groups, workers, permissions, audit, and idempo
   const reserved = first.reserveWorkerTasks({
     taskGroupId: created.taskGroup.id,
     requestId: "persistent-batch",
-    tasks: [{ fieldKey: "ads", title: "广告费", prompt: "检查广告费" }],
+    tasks: [{ agentName: "sql-investigator", fieldKey: "ads", title: "广告费", prompt: "检查广告费" }],
   })
   const worker = first.attachWorker({
     taskId: reserved.tasks[0].id,
     parentAgentId: created.agent.id,
     sessionId: "ses_persisted_worker",
   }).agent
+  assert.equal(worker.opencodeAgentName, "sql-investigator")
   first.upsertPermissionRequest({
     agent: worker,
     opencodeRequestId: "per_persisted",
@@ -710,6 +1114,26 @@ test("SQLite store persists task groups, workers, permissions, audit, and idempo
     main: created.agent,
     question: "持久化的问题",
   })
+  const changeReview = first.createChangeReview({
+    agent: worker,
+    summary: "持久化审查",
+    files: [{
+      path: "src/example.ts",
+      beforePath: "tmp/example.before.ts",
+      afterPath: "src/example.ts",
+      diff: "-old\n+new",
+      additions: 1,
+      deletions: 1,
+      rows: [{ kind: "modified", beforeLine: 1, afterLine: 1, beforeText: "old", afterText: "new" }],
+    }],
+  })
+  const jobWatch = first.createJobWatch({
+    agent: created.agent,
+    title: "持久化定时检查",
+    wakeMessage: "查询线上任务状态",
+    wakeAt: new Date(Date.now() + 60_000).toISOString(),
+    idempotencyKey: "persisted-watch",
+  }).watch
   first.close()
 
   second = new SqliteStore(databasePath)
@@ -719,10 +1143,12 @@ test("SQLite store persists task groups, workers, permissions, audit, and idempo
   assert.equal(second.listPermissionRequests({ status: "PENDING" }).length, 1)
   assert.equal(second.listAuditRecords().some((record) => record.type === "test.persisted"), true)
   assert.equal(second.getAgentQuestion(question.id)?.question, "持久化的问题")
+  assert.equal(second.getChangeReview(changeReview.id)?.summary, "持久化审查")
+  assert.equal(second.getJobWatch(jobWatch.id)?.wakeMessage, "查询线上任务状态")
   const repeated = second.reserveWorkerTasks({
     taskGroupId: created.taskGroup.id,
     requestId: "persistent-batch",
-    tasks: [{ fieldKey: "ignored", title: "不会重复", prompt: "不会重复" }],
+    tasks: [{ agentName: "build", fieldKey: "ignored", title: "不会重复", prompt: "不会重复" }],
   })
   assert.equal(repeated.created, false)
   assert.equal(repeated.tasks[0]?.id, reserved.tasks[0].id)
@@ -766,6 +1192,38 @@ test("application startup restores active sessions and marks missing sessions as
   assert.equal(missingBody.agents[0]?.lifecycleStatus, "FAILED")
   assert.match(missingBody.agents[0]?.lastError ?? "", /not found/i)
   await missingApplication.stop()
+})
+
+test("application restart recovers scheduled watches and wakes the original Session", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "opencode-control-plane-watch-recovery-"))
+  const databasePath = join(directory, "control-plane.sqlite")
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+
+  const seed = new SqliteStore(databasePath)
+  const created = seed.createTaskGroup({ title: "定时恢复测试", sessionId: "ses_watch_recovery" })
+  const watch = seed.createJobWatch({
+    agent: created.agent,
+    title: "重启后的检查",
+    wakeMessage: "读取 job-recovery 的最终结果",
+    wakeAt: new Date(Date.now() + 30).toISOString(),
+  }).watch
+  seed.close()
+
+  const adapter = new FakeAdapter()
+  adapter.sessions.push({ id: created.agent.opencodeSessionId, title: created.taskGroup.title })
+  const application = createApplication({
+    config: { ...config, databasePath },
+    adapter: adapter as unknown as OpenCodeAdapter,
+  })
+  await application.initialize()
+  const deadline = Date.now() + 1_000
+  while (adapter.prompts.length === 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.equal(adapter.prompts[0]?.sessionId, created.agent.opencodeSessionId)
+  assert.match(adapter.prompts[0]?.input.text ?? "", /job-recovery/)
+  assert.equal(application.store.getJobWatch(watch.id)?.status, "DELIVERED")
+  await application.stop()
 })
 
 test("Control Plane validates input and reports missing resources", async () => {

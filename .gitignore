@@ -1,8 +1,12 @@
 .DS_Store
+.idea/
 node_modules/
 coverage/
 .env
+.env.*
+!.env.example
 *.log
 .data/
 work/
 .git-local/
+workspace-template/.control-plane-smoke-test/
