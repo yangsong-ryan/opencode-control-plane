@@ -471,6 +471,8 @@ test("root path presents a useful service page instead of a 404", async () => {
   assert.match(response.text, /agentSignature/)
   assert.match(response.text, /messageLoadToken/)
   assert.match(response.text, /background:#ffd166/)
+  assert.match(response.text, /inline-change/)
+  assert.match(response.text, /appendInlineDiff/)
   const script = response.text.match(/<script>([\s\S]+)<\/script>/)?.[1]
   assert.ok(script)
   assert.doesNotThrow(() => new Function(script))
@@ -1113,8 +1115,8 @@ test("complete team flow keeps every role in one workspace-scoped OpenCode runti
 test("diff review blocks the tool call until the user approves or rejects the real file diff", async (t) => {
   const directory = mkdtempSync(join(tmpdir(), "opencode-diff-review-"))
   t.after(() => rmSync(directory, { recursive: true, force: true }))
-  writeFileSync(join(directory, "example.before.ts"), "export const value = 1\n")
-  writeFileSync(join(directory, "example.after.ts"), "export const value = 2\nexport const enabled = true\n")
+  writeFileSync(join(directory, "example.before.ts"), 'export const value = 1\nexport const label = "启动服务 v1"\n')
+  writeFileSync(join(directory, "example.after.ts"), 'export const value = 2\nexport const label = "启动 OpenCode 服务 v2"\nexport const enabled = true\n')
   const adapter = new FakeAdapter()
   const application = createApplication({
     config: { ...config, opencodeDirectory: directory },
@@ -1130,8 +1132,8 @@ test("diff review blocks the tool call until the user approves or rejects the re
   })
   while (application.changeReviewManager.list().length === 0) await new Promise((resolve) => setTimeout(resolve, 1))
   const first = application.changeReviewManager.list()[0]
-  assert.equal(first.additions, 2)
-  assert.equal(first.deletions, 1)
+  assert.equal(first.additions, 3)
+  assert.equal(first.deletions, 2)
   assert.match(first.files[0]?.diff ?? "", /\+export const enabled = true/)
   assert.deepEqual(first.files[0]?.rows, [
     {
@@ -1140,11 +1142,38 @@ test("diff review blocks the tool call until the user approves or rejects the re
       afterLine: 1,
       beforeText: "export const value = 1",
       afterText: "export const value = 2",
+      beforeSegments: [
+        { text: "export const value = ", changed: false },
+        { text: "1", changed: true },
+      ],
+      afterSegments: [
+        { text: "export const value = ", changed: false },
+        { text: "2", changed: true },
+      ],
+    },
+    {
+      kind: "modified",
+      beforeLine: 2,
+      afterLine: 2,
+      beforeText: 'export const label = "启动服务 v1"',
+      afterText: 'export const label = "启动 OpenCode 服务 v2"',
+      beforeSegments: [
+        { text: 'export const label = "启动服务 v', changed: false },
+        { text: "1", changed: true },
+        { text: '"', changed: false },
+      ],
+      afterSegments: [
+        { text: 'export const label = "启动', changed: false },
+        { text: " OpenCode ", changed: true },
+        { text: "服务 v", changed: false },
+        { text: "2", changed: true },
+        { text: '"', changed: false },
+      ],
     },
     {
       kind: "added",
       beforeLine: undefined,
-      afterLine: 2,
+      afterLine: 3,
       beforeText: undefined,
       afterText: "export const enabled = true",
     },

@@ -159,7 +159,7 @@ workspace-template/.opencode/agents/<agent-name>.md
 - 页面采用三栏 Agent 工作台：任务与 Agent 切换、OpenCode 风格聊天、权限中心。
 - 发送消息会立即乐观显示，并同时通过 OpenCode SSE 和 1.5 秒兜底轮询持续刷新。
 - 聊天区支持 Markdown 标题、列表、代码块、表格和安全链接；工具调用可折叠，并支持“停止本轮”而不删除 Agent 或历史。
-- `diff_review` 工具读取真实的修改前/修改后文件，生成 Diff 并阻塞等待页面确认，避免模型用文字描述改动产生偏差。
+- `diff_review` 工具读取真实的修改前/修改后文件，生成 Diff 并阻塞等待页面确认，避免模型用文字描述改动产生偏差。左右分栏会先标识新增/删除行，再对修改行做字符级行内对比：整行使用浅色背景，真正变化的片段使用深红/深绿高亮。
 - 用户点击确定后，正在等待的工具调用直接返回 `ok`；提交、推送或部署仍由 Agent 自己决定和执行。
 - 主 Agent 和 Worker 可通过 `watch_job` 登记持久化定时检查；工具立即返回，到期后后端向原 OpenCode Session 注入新消息并重新触发同一个 Agent。
 - 未到期的 Watch Job 保存在 SQLite 中，Control Plane 重启后自动恢复；可用幂等键避免工具重试产生重复提醒。

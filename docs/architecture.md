@@ -211,7 +211,7 @@ Control Plane 向原 Worker Session 发送回答
 
 ## 9. Diff、Watch Job 与持久化
 
-- `diff_review`：OpenCode Agent 配置直接允许调用，后端从 `OPENCODE_DIRECTORY` 读取真实文件，生成左右 Diff，并在独立的人工作业闸门中阻塞工具调用等待用户确认；它不经过普通权限审批 Agent，也不负责提交或推送。
+- `diff_review`：OpenCode Agent 配置直接允许调用，后端从 `OPENCODE_DIRECTORY` 读取真实文件，先生成文件行级 Diff，再为配对的修改行计算字符级行内差异片段；页面用浅色整行背景和深色片段高亮展示左右对比。超长或相似度过低的行会安全退化为整行高亮。工具在独立的人工作业闸门中阻塞等待用户确认；它不经过普通权限审批 Agent，也不负责提交或推送。
 - `watch_job`：把 Session ID、唤醒时间和消息写入 SQLite，到期后给同一个 Session 发送新消息；服务重启后恢复。
 - SQLite：属于后端状态，不属于团队工作空间；默认保存在后端目录 `.data/`。
 - OpenCode Session 历史：由 OpenCode Server 保存；后端只保存映射、状态、审批、审计和业务索引。

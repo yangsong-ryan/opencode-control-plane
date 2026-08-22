@@ -8,6 +8,7 @@ import {
   InMemoryStore,
   type AgentInstance,
   type ChangeReviewFile,
+  type ChangeReviewInlineSegment,
   type ChangeReviewRecord,
   type ChangeReviewRow,
 } from "./store.ts"
@@ -15,6 +16,9 @@ import {
 const MAX_FILES = 30
 const MAX_FILE_BYTES = 1_000_000
 const MAX_DIFF_BYTES = 2_000_000
+const MAX_INLINE_DIFF_CELLS = 300_000
+const MIN_INLINE_SIMILARITY = 0.2
+const graphemeSegmenter = new Intl.Segmenter("zh-CN", { granularity: "grapheme" })
 
 export interface DiffComparisonInput {
   beforePath: string
@@ -25,6 +29,110 @@ export interface DiffComparisonInput {
 export type DiffReviewResult =
   | { result: "ok"; reviewId: string }
   | { result: "rejected"; reviewId: string; reason?: string }
+
+function graphemes(value: string): string[] {
+  return Array.from(graphemeSegmenter.segment(value), (part) => part.segment)
+}
+
+function appendSegment(segments: ChangeReviewInlineSegment[], text: string, changed: boolean): void {
+  if (text === "") return
+  const previous = segments.at(-1)
+  if (previous?.changed === changed) previous.text += text
+  else segments.push({ text, changed })
+}
+
+function fullLineSegments(before: string, after: string): {
+  beforeSegments: ChangeReviewInlineSegment[]
+  afterSegments: ChangeReviewInlineSegment[]
+} {
+  return {
+    beforeSegments: before === "" ? [] : [{ text: before, changed: true }],
+    afterSegments: after === "" ? [] : [{ text: after, changed: true }],
+  }
+}
+
+function affixInlineDiff(before: string[], after: string[]): {
+  beforeSegments: ChangeReviewInlineSegment[]
+  afterSegments: ChangeReviewInlineSegment[]
+} {
+  let prefix = 0
+  while (prefix < before.length && prefix < after.length && before[prefix] === after[prefix]) prefix += 1
+  let suffix = 0
+  while (
+    suffix < before.length - prefix &&
+    suffix < after.length - prefix &&
+    before[before.length - 1 - suffix] === after[after.length - 1 - suffix]
+  ) suffix += 1
+  const equalCount = prefix + suffix
+  if (equalCount / Math.max(1, before.length, after.length) < MIN_INLINE_SIMILARITY) {
+    return fullLineSegments(before.join(""), after.join(""))
+  }
+  const beforeSegments: ChangeReviewInlineSegment[] = []
+  const afterSegments: ChangeReviewInlineSegment[] = []
+  const prefixText = before.slice(0, prefix).join("")
+  const suffixText = suffix === 0 ? "" : before.slice(before.length - suffix).join("")
+  appendSegment(beforeSegments, prefixText, false)
+  appendSegment(afterSegments, prefixText, false)
+  appendSegment(beforeSegments, before.slice(prefix, before.length - suffix).join(""), true)
+  appendSegment(afterSegments, after.slice(prefix, after.length - suffix).join(""), true)
+  appendSegment(beforeSegments, suffixText, false)
+  appendSegment(afterSegments, suffixText, false)
+  return { beforeSegments, afterSegments }
+}
+
+function inlineDiff(beforeText: string, afterText: string): {
+  beforeSegments: ChangeReviewInlineSegment[]
+  afterSegments: ChangeReviewInlineSegment[]
+} {
+  const before = graphemes(beforeText)
+  const after = graphemes(afterText)
+  if (before.length === 0 || after.length === 0) return fullLineSegments(beforeText, afterText)
+  if (before.length * after.length > MAX_INLINE_DIFF_CELLS) return affixInlineDiff(before, after)
+
+  const width = after.length + 1
+  const table = new Uint32Array((before.length + 1) * width)
+  for (let beforeIndex = before.length - 1; beforeIndex >= 0; beforeIndex -= 1) {
+    for (let afterIndex = after.length - 1; afterIndex >= 0; afterIndex -= 1) {
+      const position = beforeIndex * width + afterIndex
+      table[position] = before[beforeIndex] === after[afterIndex]
+        ? table[(beforeIndex + 1) * width + afterIndex + 1] + 1
+        : Math.max(table[(beforeIndex + 1) * width + afterIndex], table[position + 1])
+    }
+  }
+
+  const equalCount = table[0] ?? 0
+  if (equalCount / Math.max(before.length, after.length) < MIN_INLINE_SIMILARITY) {
+    return fullLineSegments(beforeText, afterText)
+  }
+
+  const beforeSegments: ChangeReviewInlineSegment[] = []
+  const afterSegments: ChangeReviewInlineSegment[] = []
+  let beforeIndex = 0
+  let afterIndex = 0
+  while (beforeIndex < before.length || afterIndex < after.length) {
+    if (
+      beforeIndex < before.length &&
+      afterIndex < after.length &&
+      before[beforeIndex] === after[afterIndex]
+    ) {
+      appendSegment(beforeSegments, before[beforeIndex] ?? "", false)
+      appendSegment(afterSegments, after[afterIndex] ?? "", false)
+      beforeIndex += 1
+      afterIndex += 1
+      continue
+    }
+    const removeScore = beforeIndex < before.length ? table[(beforeIndex + 1) * width + afterIndex] ?? 0 : -1
+    const addScore = afterIndex < after.length ? table[beforeIndex * width + afterIndex + 1] ?? 0 : -1
+    if (beforeIndex < before.length && (afterIndex >= after.length || removeScore >= addScore)) {
+      appendSegment(beforeSegments, before[beforeIndex] ?? "", true)
+      beforeIndex += 1
+    } else if (afterIndex < after.length) {
+      appendSegment(afterSegments, after[afterIndex] ?? "", true)
+      afterIndex += 1
+    }
+  }
+  return { beforeSegments, afterSegments }
+}
 
 function normalizedPath(path: string): string {
   return path.split(sep).join("/")
@@ -67,12 +175,14 @@ function alignDiffRows(hunks: string[]): ChangeReviewRow[] {
       for (let offset = 0; offset < Math.max(removed.length, added.length); offset += 1) {
         const before = removed[offset]
         const after = added[offset]
+        const segments = before !== undefined && after !== undefined ? inlineDiff(before.text, after.text) : undefined
         rows.push({
           kind: before !== undefined && after !== undefined ? "modified" : before !== undefined ? "deleted" : "added",
           beforeLine: before?.line,
           afterLine: after?.line,
           beforeText: before?.text,
           afterText: after?.text,
+          ...segments,
         })
       }
       continue

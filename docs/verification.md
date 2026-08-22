@@ -114,7 +114,7 @@ npm run doctor
 4. 让 Worker 调用 `ask_main_agent`，确认主 Agent收到问题并回答。
 5. 触发一个 `ask` 权限，观察静态规则、审批 Agent或人工卡片。
 6. 调用 `watch_job` 设置短延迟，确认原 Session 被唤醒。
-7. 准备两个测试文件，调用 `diff_review`，分别验证拒绝和确定。
+7. 准备两个包含中文、英文和多处局部修改的测试文件，调用 `diff_review`，确认新增行整行绿色、删除行整行红色、修改行仅变化片段深色高亮，并分别验证拒绝和确定。
 8. 重启 Control Plane，确认任务历史、Watch Job 和 Session 状态恢复。
 
 真实模型、外部数据库、日志系统和业务 Skill 的正确性属于部署环境集成测试，不由仓库内 Fake Adapter 测试替代。

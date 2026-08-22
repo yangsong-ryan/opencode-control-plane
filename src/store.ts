@@ -121,12 +121,19 @@ export interface AgentQuestion {
 
 export type ChangeReviewStatus = "PENDING" | "APPROVED" | "REJECTED"
 
+export interface ChangeReviewInlineSegment {
+  text: string
+  changed: boolean
+}
+
 export interface ChangeReviewRow {
   kind: "context" | "modified" | "added" | "deleted"
   beforeLine?: number
   afterLine?: number
   beforeText?: string
   afterText?: string
+  beforeSegments?: ChangeReviewInlineSegment[]
+  afterSegments?: ChangeReviewInlineSegment[]
 }
 
 export interface ChangeReviewFile {
