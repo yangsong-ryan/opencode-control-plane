@@ -4,6 +4,7 @@ export interface OpenCodeCapabilities {
   routes: {
     listAgents: boolean
     createSession: boolean
+    deleteSession: boolean
     listSessions: boolean
     listMessages: boolean
     promptAsync: boolean
@@ -225,6 +226,7 @@ export class OpenCodeAdapter {
       routes: {
         listAgents: routeExists(specText, "get", ["/agent", "/api/agent"]),
         createSession: routeExists(specText, "post", ["/session"]),
+        deleteSession: routeExists(specText, "delete", ["/session/{sessionID}", "/session/{id}"]),
         listSessions: routeExists(specText, "get", ["/session"]),
         listMessages: routeExists(specText, "get", [
           "/session/{sessionID}/message",
@@ -277,6 +279,14 @@ export class OpenCodeAdapter {
   async listSessions(): Promise<OpenCodeSession[]> {
     const response = await this.request("/session")
     return (await response.json()) as OpenCodeSession[]
+  }
+
+  async deleteSession(sessionId: string): Promise<boolean> {
+    const response = await this.request(`/session/${encodeURIComponent(sessionId)}`, {
+      method: "DELETE",
+      headers: this.headers(false),
+    })
+    return (await response.json()) as boolean
   }
 
   async listAgents(): Promise<OpenCodeAgentInfo[]> {

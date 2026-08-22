@@ -96,12 +96,15 @@ Agent 类型：control-plane-worker
 Control Plane 创建一个团队时：
 
 1. 创建主 Session，数据库记录其 Agent 名称为 `control-plane-main`；
-2. 创建审批 Session，`parentID` 指向主 Session，Agent 名称为 `permission-approver`；
+2. 在数据库登记只读的逻辑审批 Agent，用于页面展示聚合后的审批时间线，不长期占用一个 OpenCode Session；
 3. 主 Agent需要 Worker 时调用 `spawn_workers`；
 4. 后端为每项任务创建独立 Session，`parentID` 指向主 Session；
-5. 后续给任何 Session 发消息时，继续携带该实例保存的 Agent 名称。
+5. 遇到未知权限时，为该权限新建临时审批 Session，`parentID` 指向主 Session，Agent 名称为 `permission-approver`；
+6. 后续给主 Agent 或 Worker 发消息时，继续携带该实例保存的 Agent 名称。
 
 主从关系主要保存在 Control Plane 数据库中。OpenCode 的 `parentID` 用于补充 Session 层级，但不会替代后端的任务、角色和权限路由数据。
+
+主 Agent 和默认 Worker 使用白名单式权限：默认 `* : deny`，再逐项开放正常工作需要的工具，并明确设置 `permission.task: deny`。这种顺序符合 OpenCode“最后命中规则生效”的规则，可让原生 Task 真正从模型工具上下文中消失；配置中还保留 `tools.task: false` 以兼容新配置语义。所有团队 Worker 都由 `spawn_workers` 创建为可在页面查看和继续对话的独立 Session。`spawn_workers.tasks` 是真正的对象数组，不接受装有 JSON 的字符串。
 
 ## 5. 消息发送和提示词
 
@@ -145,9 +148,9 @@ OpenCode 原生 `permission` 决定工具行为：
 
 | Agent | 默认策略 | 关键结果 |
 |---|---|---|
-| 主 Agent | `"*": "ask"` | 保留正常 OpenCode 工具，团队编排工具直接允许，禁止 Worker/审批专用工具 |
+| 主 Agent | `"*": "ask"`，常见只读工具 `allow` | 保留正常 OpenCode 工具；读取和团队编排工具直接允许，禁止 Worker/审批专用工具 |
 | 审批 Agent | `"*": "deny"` | 只看得到 `review_permission` |
-| Worker | `"*": "ask"` | 保留正常工具，允许 `ask_main_agent`、Diff、Watch，隐藏直接问用户和团队管理工具 |
+| Worker | `"*": "ask"`，常见只读工具 `allow` | 保留正常工具；读取、`ask_main_agent`、Diff、Watch 直接允许，隐藏直接问用户和团队管理工具 |
 
 `"*": "ask"` 不是白名单。它表示所有没有被后续规则覆盖的工具仍然可见，但调用时需要审批。若某个业务 Worker 必须是严格只读白名单，应使用 `"*": "deny"`，再逐项 `allow`。
 
@@ -156,7 +159,9 @@ OpenCode 原生 `permission` 决定工具行为：
 ## 7. 权限审批链路
 
 ```text
-Worker 调用 ask 工具
+Agent 调用 `allow` 工具 → OpenCode 直接执行，Control Plane 不会收到事件或产生记录
+
+Agent 调用 `ask` 工具
         ↓
 OpenCode 暂停工具并发出 permission.asked
         ↓
@@ -165,7 +170,7 @@ Permission Manager 幂等落库
 静态规则
   ├─ 明确只读 → allow once
   ├─ 明确危险 → reject
-  └─ 无法判断 → 审批 Agent Session
+  └─ 无法判断 → 为本请求新建一次性审批 Agent Session
                          ↓
               review_permission
                ├─ approve_once
@@ -177,7 +182,13 @@ Permission Manager 调用 OpenCode 权限回复 API
 原 Worker 工具继续或终止
 ```
 
-审批 Agent只给结构化建议。它没有 OpenCode 权限回复凭证，不能授予 `always`。真正回复 OpenCode 的始终是后端 Permission Manager。
+审批 Agent只给结构化建议。每次审批都使用新的 OpenCode Session，并带入来源 Agent、Worker 任务、最近用户意图、工作空间、命令、元数据、风险和审批原则快照，因此不会受前一条审批历史或未来上下文压缩影响。任务与消息内容被标记为不可信背景数据并限制长度。页面中的审批 Agent 是后端从权限记录生成的聚合时间线。审批 Agent 没有 OpenCode 权限回复凭证，不能授予 `always`；真正回复 OpenCode 的始终是后端 Permission Manager。
+
+每条权限只接受审批 Agent 的第一个有效 `review_permission` 回调。结果入库后，重复回调被记录并忽略，临时审批 Session 在响应返回后中止并删除。`escalate` 不会回复原 OpenCode 权限，而是把记录明确切换为“待人工”并保留升级原因。
+
+每个 TaskGroup 保存一份 `approvalPolicy`。新团队使用保守默认值；主 Agent 可通过 `set_approval_policy` 根据用户要求更新。Permission Manager 在把未知权限发送给审批 Agent 时会附上当前策略。静态硬拒绝优先于动态策略，因此主 Agent 不能通过策略放开删除、强制 Git 或写数据库等明确危险行为。
+
+`external_directory` 的固定路径白名单属于 OpenCode 原生 `permission` 配置。允许跨目录边界后，具体读取、编辑或命令操作仍分别经过 `read`、`edit`、`bash` 等规则；如果只允许读取外部资料，应同时为该路径拒绝编辑并限制命令。Control Plane 只处理 OpenCode 仍然发出的 `ask`，不覆盖工作空间配置已经明确允许或拒绝的路径。
 
 ## 8. 主 Agent 与 Worker 通信
 
@@ -196,14 +207,18 @@ Control Plane 查找所属 TaskGroup 与主 Session
 Control Plane 向原 Worker Session 发送回答
 ```
 
-同理，`message_worker`、`spawn_workers`、`review_permission`、`diff_review` 和 `watch_job` 都是 OpenCode Custom Tool 到 Control Plane API 的桥接。
+同理，`message_worker`、`spawn_workers`、`set_approval_policy`、`review_permission`、`diff_review` 和 `watch_job` 都是 OpenCode Custom Tool 到 Control Plane API 的桥接。
 
 ## 9. Diff、Watch Job 与持久化
 
-- `diff_review`：后端从 `OPENCODE_DIRECTORY` 读取真实文件，生成左右 Diff，并阻塞工具调用等待用户确认；它不负责提交或推送。
+- `diff_review`：OpenCode Agent 配置直接允许调用，后端从 `OPENCODE_DIRECTORY` 读取真实文件，生成左右 Diff，并在独立的人工作业闸门中阻塞工具调用等待用户确认；它不经过普通权限审批 Agent，也不负责提交或推送。
 - `watch_job`：把 Session ID、唤醒时间和消息写入 SQLite，到期后给同一个 Session 发送新消息；服务重启后恢复。
 - SQLite：属于后端状态，不属于团队工作空间；默认保存在后端目录 `.data/`。
 - OpenCode Session 历史：由 OpenCode Server 保存；后端只保存映射、状态、审批、审计和业务索引。
+
+OpenCode 的异步 Prompt 会在 Session 忙碌时进入同一 Session 的执行队列。若 Worker 正在等待一个权限结果，主 Agent 监督消息或 Watch Job 到期消息不会直接拼接到 provider 的未完成 tool call 后；OpenCode 先等待当前运行恢复和收尾，再执行排队 Prompt。因此 provider 所要求的 `tool call → tool result` 顺序由 OpenCode Runtime 保持，Control Plane 不自行拼装原始消息数组。
+
+删除 TaskGroup 时，后端先取消未触发的 Watch Job、结束待处理 Diff、尽力拒绝待审批权限，再中止并删除主 Agent、Worker 和临时审批 Session，最后清理 SQLite 中该团队的业务记录。
 
 ## 10. 当前目录模型的边界
 

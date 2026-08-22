@@ -40,6 +40,7 @@ export interface TaskGroup {
   title: string
   rootAgentId: string
   status: "RUNNING" | "FAILED" | "CANCELLED"
+  approvalPolicy: string
   createdAt: string
   updatedAt: string
 }
@@ -75,9 +76,16 @@ export interface PermissionRequestRecord {
   action: string
   resources: string[]
   metadata: Record<string, unknown>
+  source?: Record<string, unknown>
+  tool?: Record<string, unknown>
   risk: PermissionRisk
   status: PermissionStatus
   reviewRequested: boolean
+  approvalSessionId?: string
+  approvalPolicySnapshot?: string
+  approvalContextSnapshot?: string
+  approvalReview?: "approve_once" | "reject" | "escalate"
+  approvalReason?: string
   recommendationRequested?: boolean
   decision?: PermissionDecision
   decisionSource?: PermissionDecisionSource
@@ -234,7 +242,9 @@ export class InMemoryStore {
     this.changeReviews.clear()
     this.jobWatches.clear()
 
-    for (const taskGroup of snapshot.taskGroups) this.taskGroups.set(taskGroup.id, taskGroup)
+    for (const taskGroup of snapshot.taskGroups) {
+      this.taskGroups.set(taskGroup.id, { ...taskGroup, approvalPolicy: taskGroup.approvalPolicy ?? "" })
+    }
     for (const agent of snapshot.agents) {
       const compatible = { ...agent, opencodeAgentName: agent.opencodeAgentName ?? "build" }
       this.agents.set(agent.id, compatible)
@@ -261,7 +271,7 @@ export class InMemoryStore {
     for (const watch of snapshot.jobWatches ?? []) this.jobWatches.set(watch.id, watch)
   }
 
-  createTaskGroup(input: { title: string; sessionId: string; agentName?: string }): { taskGroup: TaskGroup; agent: AgentInstance } {
+  createTaskGroup(input: { title: string; sessionId: string; agentName?: string; approvalPolicy: string }): { taskGroup: TaskGroup; agent: AgentInstance } {
     const timestamp = new Date().toISOString()
     const taskGroupId = randomUUID()
     const agentId = randomUUID()
@@ -271,6 +281,7 @@ export class InMemoryStore {
       title: input.title,
       rootAgentId: agentId,
       status: "RUNNING",
+      approvalPolicy: input.approvalPolicy,
       createdAt: timestamp,
       updatedAt: timestamp,
     }
@@ -291,6 +302,52 @@ export class InMemoryStore {
     this.agentBySession.set(agent.opencodeSessionId, agent.id)
     this.persist()
     return { taskGroup, agent }
+  }
+
+  setTaskGroupApprovalPolicy(taskGroupId: string, approvalPolicy: string): TaskGroup {
+    const current = this.taskGroups.get(taskGroupId)
+    if (current === undefined) throw new Error("TASK_GROUP_NOT_FOUND")
+    const updated = { ...current, approvalPolicy, updatedAt: new Date().toISOString() }
+    this.taskGroups.set(taskGroupId, updated)
+    this.persist()
+    return updated
+  }
+
+  renameTaskGroup(taskGroupId: string, title: string): TaskGroup {
+    const current = this.taskGroups.get(taskGroupId)
+    if (current === undefined) throw new Error("TASK_GROUP_NOT_FOUND")
+    const timestamp = new Date().toISOString()
+    const updated = { ...current, title, updatedAt: timestamp }
+    this.taskGroups.set(taskGroupId, updated)
+    const main = this.agents.get(current.rootAgentId)
+    if (main !== undefined) this.agents.set(main.id, { ...main, name: title, updatedAt: timestamp })
+    this.persist()
+    return updated
+  }
+
+  deleteTaskGroup(taskGroupId: string): ReturnType<InMemoryStore["getTaskGroup"]> {
+    const group = this.getTaskGroup(taskGroupId)
+    if (group === undefined) return undefined
+    this.taskGroups.delete(taskGroupId)
+    const agentIds = new Set(group.agents.map((agent) => agent.id))
+    for (const agent of group.agents) {
+      this.agents.delete(agent.id)
+      this.agentBySession.delete(agent.opencodeSessionId)
+    }
+    for (const [id, task] of this.workerTasks) if (task.taskGroupId === taskGroupId) this.workerTasks.delete(id)
+    for (const key of this.spawnRequests.keys()) if (key.startsWith(`${taskGroupId}:`)) this.spawnRequests.delete(key)
+    for (const [id, permission] of this.permissionRequests) {
+      if (permission.taskGroupId !== taskGroupId) continue
+      this.permissionRequests.delete(id)
+      this.permissionByExternalId.delete(`${permission.opencodeSessionId}:${permission.opencodeRequestId}`)
+    }
+    for (const [id, question] of this.agentQuestions) if (question.taskGroupId === taskGroupId) this.agentQuestions.delete(id)
+    for (const [id, review] of this.changeReviews) if (review.taskGroupId === taskGroupId) this.changeReviews.delete(id)
+    for (const [id, watch] of this.jobWatches) if (watch.taskGroupId === taskGroupId) this.jobWatches.delete(id)
+    const retainedAudits = this.auditRecords.filter((record) => record.taskGroupId !== taskGroupId && (record.agentId === undefined || !agentIds.has(record.agentId)))
+    this.auditRecords.splice(0, this.auditRecords.length, ...retainedAudits)
+    this.persist()
+    return group
   }
 
   getTaskGroup(id: string): {
@@ -483,6 +540,8 @@ export class InMemoryStore {
     action: string
     resources: string[]
     metadata: Record<string, unknown>
+    source?: Record<string, unknown>
+    tool?: Record<string, unknown>
     risk: PermissionRisk
   }): { created: boolean; permission: PermissionRequestRecord } {
     const externalKey = `${input.agent.opencodeSessionId}:${input.opencodeRequestId}`
@@ -502,6 +561,8 @@ export class InMemoryStore {
       action: input.action,
       resources: [...input.resources],
       metadata: { ...input.metadata },
+      source: input.source === undefined ? undefined : { ...input.source },
+      tool: input.tool === undefined ? undefined : { ...input.tool },
       risk: input.risk,
       status: "PENDING",
       reviewRequested: false,
@@ -531,11 +592,42 @@ export class InMemoryStore {
       .sort((left, right) => right.requestedAt.localeCompare(left.requestedAt))
   }
 
-  markPermissionReviewRequested(id: string): PermissionRequestRecord | undefined {
-    const current = this.permissionRequests.get(id)
+  markPermissionReviewRequested(input: {
+    id: string
+    approvalSessionId: string
+    approvalPolicySnapshot: string
+    approvalContextSnapshot: string
+  }): PermissionRequestRecord | undefined {
+    const current = this.permissionRequests.get(input.id)
     if (current === undefined || current.status !== "PENDING") return current
-    const updated = { ...current, reviewRequested: true, updatedAt: new Date().toISOString() }
-    this.permissionRequests.set(id, updated)
+    const updated = {
+      ...current,
+      reviewRequested: true,
+      approvalSessionId: input.approvalSessionId,
+      approvalPolicySnapshot: input.approvalPolicySnapshot,
+      approvalContextSnapshot: input.approvalContextSnapshot,
+      updatedAt: new Date().toISOString(),
+    }
+    this.permissionRequests.set(input.id, updated)
+    this.touchTaskGroup(current.taskGroupId, updated.updatedAt)
+    this.persist()
+    return updated
+  }
+
+  recordPermissionApprovalReview(input: {
+    id: string
+    review: "approve_once" | "reject" | "escalate"
+    reason: string
+  }): PermissionRequestRecord | undefined {
+    const current = this.permissionRequests.get(input.id)
+    if (current === undefined) return undefined
+    const updated = {
+      ...current,
+      approvalReview: input.review,
+      approvalReason: input.reason,
+      updatedAt: new Date().toISOString(),
+    }
+    this.permissionRequests.set(input.id, updated)
     this.touchTaskGroup(current.taskGroupId, updated.updatedAt)
     this.persist()
     return updated
@@ -815,6 +907,10 @@ export class InMemoryStore {
     const timestamp = new Date().toISOString()
 
     for (const [agentId, agent] of this.agents) {
+      if (agent.role === "APPROVER" && agent.opencodeSessionId.startsWith("logical-approver:")) {
+        activeAgents += 1
+        continue
+      }
       if (!activeSessionIds.has(agent.opencodeSessionId)) {
         missingAgents += 1
         this.agents.set(agentId, {

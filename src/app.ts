@@ -7,6 +7,7 @@ import { AgentCommunicationManager } from "./agent-communication-manager.ts"
 import { ChangeReviewManager } from "./change-review-manager.ts"
 import {
   approvalAgentSystem,
+  defaultApprovalPolicy,
   mainAgentSystem,
   workerAgentSystem,
 } from "./agent-prompts.ts"
@@ -79,9 +80,10 @@ function requiredString(value: unknown, name: string): string {
 }
 
 function workerTaskInputs(value: unknown, defaultAgentName: string): WorkerTaskInput[] {
-  if (!Array.isArray(value) || value.length === 0 || value.length > 20) throw new Error("INVALID_TASKS")
+  if (!Array.isArray(value)) throw new Error("INVALID_TASKS_ARRAY_REQUIRED")
+  if (value.length === 0 || value.length > 20) throw new Error("INVALID_TASKS_COUNT")
   return value.map((item, index) => {
-    if (item === null || Array.isArray(item) || typeof item !== "object") throw new Error("INVALID_TASKS")
+    if (item === null || Array.isArray(item) || typeof item !== "object") throw new Error(`INVALID_TASKS_${index}_OBJECT`)
     const record = item as Record<string, unknown>
     return {
       fieldKey: requiredString(record.field_key ?? record.fieldKey, `tasks_${index}_field_key`),
@@ -157,6 +159,64 @@ function emptyAssistantWarning(messages: Array<{ info?: Record<string, unknown>;
     return "OpenCode 已结束本轮运行，但模型返回了零 token 和空内容。请配置一个可用模型后重试。"
   }
   return undefined
+}
+
+function approvalTimeline(store: InMemoryStore, taskGroupId: string): Array<{
+  info: Record<string, unknown>
+  parts: Array<Record<string, unknown>>
+}> {
+  const permissions = store.listPermissionRequests({ taskGroupId })
+    .filter((permission) => permission.reviewRequested)
+    .sort((left, right) => left.requestedAt.localeCompare(right.requestedAt))
+  return permissions.flatMap((permission) => {
+    const request = {
+      info: {
+        id: `approval-request-${permission.id}`,
+        role: "user",
+        time: { created: permission.requestedAt },
+      },
+      parts: [{
+        type: "text",
+        text: [
+          `权限审批请求：${permission.action}`,
+          `资源：${JSON.stringify(permission.resources)}`,
+          `元数据：${JSON.stringify(permission.metadata)}`,
+          `风险：${permission.risk}`,
+          `本次审批原则：${permission.approvalPolicySnapshot ?? defaultApprovalPolicy}`,
+          `来源任务上下文：\n${permission.approvalContextSnapshot ?? "历史记录未保存来源上下文。"}`,
+        ].join("\n"),
+      }],
+    }
+    if (permission.approvalReview === undefined) return [request]
+    const output = {
+      review: permission.approvalReview,
+      reason: permission.approvalReason,
+      finalStatus: permission.status,
+    }
+    return [
+      request,
+      {
+        info: {
+          id: `approval-result-${permission.id}`,
+          role: "assistant",
+          time: { created: permission.updatedAt, completed: Date.parse(permission.updatedAt) },
+        },
+        parts: [{
+          type: "tool",
+          tool: "review_permission",
+          state: {
+            status: "completed",
+            input: {
+              permission_id: permission.id,
+              review: permission.approvalReview,
+              reason: permission.approvalReason,
+            },
+            output,
+          },
+        }],
+      },
+    ]
+  })
 }
 
 function requiredRoutesAvailable(capabilities: OpenCodeCapabilities): boolean {
@@ -328,20 +388,16 @@ export function createApplication(options: ApplicationOptions) {
         title,
         model: options.config.opencodeModel,
       })
-      const approvalSession = await adapter.createSession({
-        title: `${title} / 权限审批`,
-        parentSessionId: session.id,
-        model: options.config.opencodeModel,
-      })
       const created = store.createTaskGroup({
         title,
         sessionId: session.id,
         agentName: options.config.mainAgentName,
+        approvalPolicy: defaultApprovalPolicy,
       })
       const approver = store.attachApprover({
         taskGroupId: created.taskGroup.id,
         parentAgentId: created.agent.id,
-        sessionId: approvalSession.id,
+        sessionId: `logical-approver:${created.taskGroup.id}`,
         agentName: options.config.approvalAgentName,
       })
       const result = { ...created, approver }
@@ -404,13 +460,41 @@ export function createApplication(options: ApplicationOptions) {
         return
       }
       const body = await readJson(request, options.config.maxRequestBytes)
+      const permissionId = requiredString(body.permission_id, "permission_id")
+      const callerSessionId = requiredString(body.caller_session_id, "caller_session_id")
       const result = await permissionManager.applyApprovalReview({
-        permissionId: requiredString(body.permission_id, "permission_id"),
-        callerSessionId: requiredString(body.caller_session_id, "caller_session_id"),
+        permissionId,
+        callerSessionId,
         review: permissionReview(body.review),
         reason: requiredString(body.reason, "reason"),
       })
       sendJson(response, 200, result)
+      permissionManager.sealApprovalSession(permissionId, callerSessionId)
+      return
+    }
+
+    if (method === "POST" && url.pathname === "/internal/orchestrator/set-approval-policy") {
+      if (options.config.toolToken !== undefined && request.headers["x-control-plane-token"] !== options.config.toolToken) {
+        sendError(response, 401, "INVALID_TOOL_TOKEN", "Invalid Control Plane tool token")
+        return
+      }
+      const body = await readJson(request, options.config.maxRequestBytes)
+      const caller = store.getAgentBySession(requiredString(body.caller_session_id, "caller_session_id"))
+      if (caller === undefined || caller.role !== "MAIN") {
+        sendError(response, 403, "CALLER_IS_NOT_MAIN_AGENT", "Only a registered main Agent can update approval policy")
+        return
+      }
+      const policy = requiredString(body.policy, "policy")
+      if (policy.length > 8_000) throw new Error("INVALID_POLICY")
+      const taskGroup = store.setTaskGroupApprovalPolicy(caller.taskGroupId, policy)
+      store.appendAudit({
+        type: "permission.policy_updated",
+        taskGroupId: caller.taskGroupId,
+        agentId: caller.id,
+        data: { policy },
+      })
+      events.publish("permission.policy_updated", { taskGroupId: caller.taskGroupId, policy })
+      sendJson(response, 200, { taskGroupId: taskGroup.id, policy: taskGroup.approvalPolicy })
       return
     }
 
@@ -542,6 +626,59 @@ export function createApplication(options: ApplicationOptions) {
     }
 
     const taskGroupMatch = url.pathname.match(/^\/api\/task-groups\/([^/]+)$/)
+    if (method === "PATCH" && taskGroupMatch !== null) {
+      const taskGroupId = decodeURIComponent(taskGroupMatch[1])
+      if (store.getTaskGroup(taskGroupId) === undefined) {
+        sendError(response, 404, "TASK_GROUP_NOT_FOUND", "Task group not found")
+        return
+      }
+      const body = await readJson(request, options.config.maxRequestBytes)
+      const taskGroup = store.renameTaskGroup(taskGroupId, requiredString(body.title, "title"))
+      events.publish("task_group.renamed", taskGroup)
+      sendJson(response, 200, { taskGroup })
+      return
+    }
+
+    if (method === "DELETE" && taskGroupMatch !== null) {
+      const taskGroupId = decodeURIComponent(taskGroupMatch[1])
+      const group = store.getTaskGroup(taskGroupId)
+      if (group === undefined) {
+        sendError(response, 404, "TASK_GROUP_NOT_FOUND", "Task group not found")
+        return
+      }
+      changeReviewManager.cancelTaskGroup(taskGroupId)
+      watchJobManager.cancelTaskGroup(taskGroupId)
+      const pending = store.listPermissionRequests({ taskGroupId, status: "PENDING" })
+      for (const permission of pending) {
+        await permissionManager.decide(
+          permission.id,
+          "reject",
+          "HUMAN",
+          "团队已删除，未完成的权限请求已拒绝。",
+        ).catch(() => undefined)
+      }
+      const sessionIds = new Set([
+        ...group.agents
+          .filter((agent) => !agent.opencodeSessionId.startsWith("logical-approver:"))
+          .map((agent) => agent.opencodeSessionId),
+        ...store.listPermissionRequests({ taskGroupId })
+          .map((permission) => permission.approvalSessionId)
+          .filter((sessionId): sessionId is string => sessionId !== undefined),
+      ])
+      const cleanupWarnings: string[] = []
+      for (const sessionId of sessionIds) {
+        await adapter.abortSession(sessionId).catch(() => false)
+        await adapter.deleteSession(sessionId).catch((error) => {
+          cleanupWarnings.push(error instanceof Error ? error.message : String(error))
+          return false
+        })
+      }
+      store.deleteTaskGroup(taskGroupId)
+      events.publish("task_group.deleted", { taskGroupId })
+      sendJson(response, 200, { deleted: true, taskGroupId, cleanupWarnings })
+      return
+    }
+
     if (method === "GET" && taskGroupMatch !== null) {
       const result = store.getTaskGroup(decodeURIComponent(taskGroupMatch[1]))
       if (result === undefined) {
@@ -562,6 +699,10 @@ export function createApplication(options: ApplicationOptions) {
       }
 
       if (method === "GET") {
+        if (agent.role === "APPROVER") {
+          sendJson(response, 200, { items: approvalTimeline(store, agent.taskGroupId), agent })
+          return
+        }
         if (
           agent.lifecycleStatus === "FAILED" &&
           agent.lastError === "OpenCode Session was not found during startup recovery."
@@ -579,6 +720,10 @@ export function createApplication(options: ApplicationOptions) {
       }
 
       if (method === "POST") {
+        if (agent.role === "APPROVER") {
+          sendError(response, 403, "APPROVAL_AGENT_READ_ONLY", "Approval Agent timeline is read-only")
+          return
+        }
         if (agent.lifecycleStatus === "FAILED") {
           sendError(
             response,
@@ -617,6 +762,10 @@ export function createApplication(options: ApplicationOptions) {
         sendError(response, 404, "AGENT_NOT_FOUND", "Agent not found")
         return
       }
+      if (agent.role === "APPROVER") {
+        sendError(response, 400, "APPROVAL_AGENT_LOGICAL_ONLY", "Approval Agent has no persistent run to stop")
+        return
+      }
       const aborted = await adapter.abortSession(agent.opencodeSessionId)
       store.setAgentStatus(agent.id, "IDLE")
       events.publish("agent.aborted", { agentId, aborted })
@@ -649,7 +798,12 @@ export function createApplication(options: ApplicationOptions) {
         return
       }
       if (error instanceof Error && error.message.startsWith("INVALID_")) {
-        sendError(response, 400, error.message, "A required field is missing or invalid")
+        const validationMessages: Record<string, string> = {
+          INVALID_TASKS_ARRAY_REQUIRED:
+            "tasks must be an actual JSON array, not a JSON-encoded string. Pass tasks: [{ agent_name, field_key, title, prompt }].",
+          INVALID_TASKS_COUNT: "tasks must contain between 1 and 20 worker assignments.",
+        }
+        sendError(response, 400, error.message, validationMessages[error.message] ?? "A required field is missing or invalid")
         return
       }
       if (error instanceof Error && error.message === "PERMISSION_NOT_FOUND") {

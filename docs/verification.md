@@ -13,16 +13,16 @@ npm test
 | OpenCode Adapter | 健康检查、OpenAPI 能力探测、Session、消息、SSE、权限回复请求格式 |
 | 目录路由 | 每个项目请求都携带 `directory` 查询参数和 `x-opencode-directory` |
 | 目录拆分 | 默认团队工作空间为 `workspace-template/`，SQLite 留在后端 `.data/` |
-| 团队创建 | 主 Session 与独立审批 Session、父子关系和原生 Agent 名称 |
+| 团队生命周期 | 必填名称、创建、改名、删除、主 Session 清理与逻辑审批时间线 |
 | 主 Agent | 用户发消息、动态 system、停止本轮、历史读取 |
 | Worker | Agent 类型发现、并发创建、幂等、直接聊天、复用和主动监工 |
 | 主从通信 | `ask_main_agent → answer_worker → 原 Worker Session` |
-| 权限 | 只读自动允许、危险命令拒绝、未知请求转审批 Agent、人工接管、权限回写 |
+| 权限 | OpenCode 原生 allow/ask 边界、静态兜底、危险命令拒绝、动态团队策略、每次未知请求使用全新审批 Session、回调身份隔离、人工接管、权限回写 |
 | Agent 配置 | 后端不发送 `tools`，Session 不注入硬编码 permission |
 | Diff | 真实文件读取、左右行对齐、批准和拒绝结果返回阻塞中的工具 |
 | Watch Job | 持久化、幂等、到期唤醒同一 Session、重启恢复和取消 |
 | 存储恢复 | SQLite 关闭重开、Session 对账、缺失 Session 标记失败 |
-| Web | 首页脚本可执行、Markdown、工具折叠、审查与权限中心基础结构 |
+| Web | 首页脚本可执行、空名称校验、改名/删除入口、Markdown、工具折叠、审批 Agent 聚合时间线、选区与滚动保持、IME 安全的回车发送、审查与权限中心基础结构 |
 
 其中“完整团队流程”测试会在一个场景内连续验证：
 
@@ -79,13 +79,13 @@ npm install --prefix /absolute/path/to/team-workspace/.opencode
 
 | Agent | 实测可见工具摘要 | 实测隐藏工具摘要 |
 |---|---|---|
-| `control-plane-main` | 正常 OpenCode 工具，以及 `list_agent_types`、`list_active_agents`、`spawn_workers`、`answer_worker`、`list_workers`、`message_worker`、`diff_review`、`watch_job` | `ask_main_agent`、`review_permission` |
+| `control-plane-main` | 正常 OpenCode 工具，以及 `list_agent_types`、`list_active_agents`、`set_approval_policy`、`spawn_workers`、`answer_worker`、`list_workers`、`message_worker`、`diff_review`、`watch_job` | `ask_main_agent`、`review_permission` |
 | `permission-approver` | 仅 `review_permission` | `bash`、`read`、`edit`、`question`、团队管理工具等全部其他工具 |
-| `control-plane-worker` | 正常 OpenCode 工具，以及 `ask_main_agent`、`diff_review`、`watch_job` | `question`、团队创建/管理工具、`review_permission` |
+| `control-plane-worker` | 正常 OpenCode 工具，以及 `ask_main_agent`、`diff_review`、`watch_job` | `question`、`set_approval_policy`、团队创建/管理工具、`review_permission` |
 
 `debug agent` 输出中的 `invalid` 是 OpenCode 内部用于承接无效工具调用的保底项，不是项目定义的业务工具。
 
-注意，Leader 和 Worker 当前使用 `"*": "ask"`，所以它们不是严格白名单：未明确 `deny` 的普通 OpenCode 工具仍会发给模型。审批 Agent 使用 `"*": "deny"` 后逐项放行，因此它的最终集合严格只有一个工具。如果新增业务 Agent 需要严格白名单，应采用审批 Agent 相同的默认拒绝方式。
+注意，Leader 和 Worker 当前使用 `"*": "ask"`，所以它们不是严格白名单：未明确 `deny` 的普通 OpenCode 工具仍会发给模型；`read`、`grep`、`glob`、`list` 和 `skill` 又被明确覆盖为 `allow`，因此这些调用不会产生后台审批记录。审批 Agent 使用 `"*": "deny"` 后逐项放行，因此它的最终集合严格只有一个工具。如果新增业务 Agent 需要严格白名单，应采用审批 Agent 相同的默认拒绝方式。
 
 如需做辅助人工检查，可以分别给三个 Agent 发送下面这句话，但不能用其回答替代上述自动验证：
 

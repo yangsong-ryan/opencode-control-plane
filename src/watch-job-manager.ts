@@ -90,6 +90,12 @@ export class WatchJobManager {
     return watch
   }
 
+  cancelTaskGroup(taskGroupId: string): number {
+    const scheduled = this.store.listJobWatches({ taskGroupId, status: "SCHEDULED" })
+    for (const watch of scheduled) this.cancel(watch.id)
+    return scheduled.length
+  }
+
   async deliverDue(now = Date.now()): Promise<number> {
     const due = this.store
       .listJobWatches({ status: "SCHEDULED" })

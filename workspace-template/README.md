@@ -41,9 +41,9 @@ opencode debug agent permission-approver
 
 三个核心 Agent 直接定义在 `opencode.json` 的 `agent` 字段中：
 
-- `control-plane-main`：接收用户任务、发现和管理 Worker；
+- `control-plane-main`：接收用户任务、发现和管理 Worker，并可通过 `set_approval_policy` 更新当前团队审批原则；
 - `control-plane-worker`：持续执行任务，并通过 `ask_main_agent` 向主 Agent 提问；
-- `permission-approver`：只审核后端转发的未知权限请求。
+- `permission-approver`：只审核后端转发的未知权限请求；每条请求使用全新的临时 Session，页面展示的是后端聚合时间线。
 
 修改 `prompt` 可以改变角色行为，修改 `permission` 可以控制工具可见性和执行方式：
 
@@ -62,6 +62,27 @@ opencode debug agent permission-approver
 - `deny`：工具不发送给模型；
 - `allow`：工具可见，并由 OpenCode 直接执行；
 - `ask`：工具可见，调用后进入 Control Plane 权限流程。
+
+`allow` 不会产生后台权限记录；只有 `ask` 会触发 Control Plane。模板已直接允许主 Agent 和 Worker 的常见读取工具，后台静态规则仅作为其他 Agent 配置、旧 Session 或额外 `ask` 的兜底。
+
+外部目录可以直接使用 OpenCode 原生路径规则配置。例如只允许读取一个外部资料目录：
+
+```json
+"permission": {
+  "external_directory": {
+    "/absolute/path/to/approved-data/**": "allow",
+    "*": "ask"
+  },
+  "read": {
+    "/absolute/path/to/approved-data/**": "allow"
+  },
+  "edit": {
+    "/absolute/path/to/approved-data/**": "deny"
+  }
+}
+```
+
+`external_directory` 只打开跨工作空间的目录边界；`read`、`edit`、`bash` 等具体动作仍由各自规则控制。
 
 ## 新增业务 Agent
 

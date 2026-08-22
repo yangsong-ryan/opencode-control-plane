@@ -89,6 +89,7 @@ class FakeAdapter {
     message?: string
   }> = []
   abortCount = 0
+  deletedSessions: string[] = []
   activeCreates = 0
   maxActiveCreates = 0
   private nextSession = 1
@@ -117,6 +118,7 @@ class FakeAdapter {
       routes: {
         listAgents: true,
         createSession: true,
+        deleteSession: true,
         listSessions: true,
         listMessages: true,
         promptAsync: true,
@@ -151,6 +153,13 @@ class FakeAdapter {
 
   async listSessions(): Promise<OpenCodeSession[]> {
     return [...this.sessions]
+  }
+
+  async deleteSession(sessionId: string): Promise<boolean> {
+    this.deletedSessions.push(sessionId)
+    const index = this.sessions.findIndex((session) => session.id === sessionId)
+    if (index !== -1) this.sessions.splice(index, 1)
+    return true
   }
 
   async listAgents(): Promise<OpenCodeAgentInfo[]> {
@@ -369,33 +378,62 @@ test("connection failures include the endpoint, root cause, and an actionable st
   assert.match(formatted, /OPENCODE_BASE_URL/)
 })
 
-test("Control Plane creates main and dedicated approval sessions", async () => {
+test("Control Plane creates one main session and a logical approval timeline", async () => {
   const adapter = new FakeAdapter()
   const application = createApplication({ config, adapter: adapter as unknown as OpenCodeAdapter })
 
   const created = await inject(application, "POST", "/api/task-groups", { title: "商品损益排查" })
   assert.equal(created.statusCode, 201)
   const body = created.json as {
-    taskGroup: { id: string; rootAgentId: string }
+    taskGroup: { id: string; rootAgentId: string; approvalPolicy: string }
     agent: { id: string; opencodeSessionId: string; opencodeAgentName: string }
     approver: { id: string; role: string; opencodeSessionId: string; parentAgentId: string; opencodeAgentName: string }
   }
   assert.equal(body.agent.id, body.taskGroup.rootAgentId)
+  assert.match(body.taskGroup.approvalPolicy, /永远不能授予持久权限/)
   assert.equal(body.agent.opencodeSessionId, "ses_1")
   assert.equal(body.agent.opencodeAgentName, "control-plane-main")
   assert.equal(adapter.sessions[0]?.title, "商品损益排查")
   assert.equal(adapter.sessionInputs[0]?.permission, undefined)
   assert.equal(body.approver.role, "APPROVER")
-  assert.equal(body.approver.opencodeSessionId, "ses_2")
+  assert.equal(body.approver.opencodeSessionId, "logical-approver:" + body.taskGroup.id)
   assert.equal(body.approver.parentAgentId, body.agent.id)
   assert.equal(body.approver.opencodeAgentName, "permission-approver")
-  assert.equal(adapter.sessions[1]?.parentID, "ses_1")
-  assert.equal(adapter.sessionInputs[1]?.permission, undefined)
+  assert.equal(adapter.sessions.length, 1)
 
   const details = await inject(application, "GET", `/api/task-groups/${body.taskGroup.id}`)
   assert.equal(details.statusCode, 200)
   const detailsBody = details.json as { agents: Array<{ id: string }> }
   assert.deepEqual(new Set(detailsBody.agents.map((agent) => agent.id)), new Set([body.agent.id, body.approver.id]))
+})
+
+test("team titles are required, editable, and deletable with their OpenCode sessions", async () => {
+  const adapter = new FakeAdapter()
+  const application = createApplication({ config, adapter: adapter as unknown as OpenCodeAdapter })
+
+  const blank = await inject(application, "POST", "/api/task-groups", { title: "   " })
+  assert.equal(blank.statusCode, 400)
+
+  const created = await inject(application, "POST", "/api/task-groups", { title: "临时团队" })
+  const body = created.json as {
+    taskGroup: { id: string }
+    agent: { opencodeSessionId: string }
+  }
+  const renamed = await inject(application, "PATCH", "/api/task-groups/" + body.taskGroup.id, {
+    title: "长期任务团队",
+  })
+  assert.equal(renamed.statusCode, 200)
+  assert.equal((renamed.json as { taskGroup: { title: string } }).taskGroup.title, "长期任务团队")
+  const blankRename = await inject(application, "PATCH", "/api/task-groups/" + body.taskGroup.id, {
+    title: "\n",
+  })
+  assert.equal(blankRename.statusCode, 400)
+
+  const deleted = await inject(application, "DELETE", "/api/task-groups/" + body.taskGroup.id)
+  assert.equal(deleted.statusCode, 200)
+  assert.deepEqual(adapter.deletedSessions, [body.agent.opencodeSessionId])
+  const missing = await inject(application, "GET", "/api/task-groups/" + body.taskGroup.id)
+  assert.equal(missing.statusCode, 404)
 })
 
 test("root path presents a useful service page instead of a 404", async () => {
@@ -405,6 +443,10 @@ test("root path presents a useful service page instead of a 404", async () => {
   assert.equal(response.headers.get("content-type"), "text/html; charset=utf-8")
   assert.match(response.text, /Agent Teams/)
   assert.match(response.text, /创建 Agent Team/)
+  assert.match(response.text, /placeholder="输入团队名称"/)
+  assert.doesNotMatch(response.text, /value="商品损益排查"/)
+  assert.match(response.text, /id="rename-team"/)
+  assert.match(response.text, /id="delete-team"/)
   assert.doesNotMatch(response.text, /批量创建 Worker/)
   assert.match(response.text, /\/api\/task-groups/)
   assert.match(response.text, /Worker 出现后/)
@@ -419,6 +461,16 @@ test("root path presents a useful service page instead of a 404", async () => {
   assert.match(response.text, /distance<=24/)
   assert.match(response.text, /isActivelyWaiting/)
   assert.match(response.text, /return null/)
+  assert.match(response.text, /权限审批 Agent/)
+  assert.match(response.text, /Agent 审批中/)
+  assert.match(response.text, /审批 Agent 已升级为人工审批/)
+  assert.match(response.text, /升级人工原因/)
+  assert.match(response.text, /Enter 发送 · Shift \+ Enter 换行/)
+  assert.match(response.text, /event\.isComposing/)
+  assert.match(response.text, /selectionInside/)
+  assert.match(response.text, /agentSignature/)
+  assert.match(response.text, /messageLoadToken/)
+  assert.match(response.text, /background:#ffd166/)
   const script = response.text.match(/<script>([\s\S]+)<\/script>/)?.[1]
   assert.ok(script)
   assert.doesNotThrow(() => new Function(script))
@@ -443,19 +495,26 @@ test("default deployment separates backend state from the bundled team workspace
 
 test("project OpenCode config owns Agent tool visibility and permissions", () => {
   const projectConfig = JSON.parse(readFileSync(join(process.cwd(), "workspace-template", "opencode.json"), "utf8")) as {
-    agent: Record<string, { prompt?: string; permission: Record<string, string> }>
+    agent: Record<string, { prompt?: string; tools?: Record<string, boolean>; permission: Record<string, unknown> }>
   }
   const main = projectConfig.agent["control-plane-main"]
   const approver = projectConfig.agent["permission-approver"]
   const worker = projectConfig.agent["control-plane-worker"]
-  assert.match(main?.prompt ?? "", /NATIVE_MAIN_PROMPT_V1/)
-  assert.match(approver?.prompt ?? "", /NATIVE_APPROVER_PROMPT_V1/)
+  assert.match(main?.prompt ?? "", /NATIVE_MAIN_PROMPT_V2/)
+  assert.match(approver?.prompt ?? "", /NATIVE_APPROVER_PROMPT_V2/)
   assert.match(worker?.prompt ?? "", /NATIVE_WORKER_PROMPT_V1/)
   assert.equal(main?.permission.spawn_workers, "allow")
+  assert.equal(main?.permission.set_approval_policy, "allow")
+  assert.equal(main?.permission.read, "allow")
+  assert.equal(main?.tools?.task, false)
+  assert.equal(main?.permission.task, "deny")
   assert.equal(approver?.permission["*"], "deny")
   assert.equal(approver?.permission.review_permission, "allow")
   assert.equal(worker?.permission.question, "deny")
   assert.equal(worker?.permission.ask_main_agent, "allow")
+  assert.equal(worker?.tools?.task, false)
+  assert.equal(worker?.permission.task, "deny")
+  assert.equal(worker?.permission.set_approval_policy, "deny")
 })
 
 test("Control Plane sends prompts, returns history, and aborts a main agent", async () => {
@@ -623,8 +682,8 @@ test("spawns independent child sessions in a batch and deduplicates retries", as
   assert.equal(firstBody.agents.length, 2)
   assert.ok(firstBody.agents.every((worker) => worker.role === "WORKER"))
   assert.ok(firstBody.agents.every((worker) => worker.parentAgentId === mainAgent.id))
-  assert.deepEqual(adapter.sessions.slice(2).map((session) => session.parentID), ["ses_1", "ses_1"])
-  assert.ok(adapter.sessionInputs.slice(2).every((input) => input.permission === undefined))
+  assert.deepEqual(adapter.sessions.slice(1).map((session) => session.parentID), ["ses_1", "ses_1"])
+  assert.ok(adapter.sessionInputs.slice(1).every((input) => input.permission === undefined))
   assert.deepEqual(adapter.prompts.map((prompt) => prompt.input.agent), ["sql-investigator", "build"])
   assert.deepEqual(adapter.prompts.map((prompt) => prompt.input.text), ["检查广告费", "检查履约费"])
   assert.ok(adapter.prompts.every((prompt) => !Object.hasOwn(prompt.input, "tools")))
@@ -633,12 +692,22 @@ test("spawns independent child sessions in a batch and deduplicates retries", as
   const repeated = await inject(application, "POST", `/api/task-groups/${taskGroup.id}/workers`, batch)
   assert.equal(repeated.statusCode, 200)
   assert.equal((repeated.json as { idempotent: boolean }).idempotent, true)
-  assert.equal(adapter.sessions.length, 4)
+  assert.equal(adapter.sessions.length, 3)
 
   const group = await inject(application, "GET", `/api/task-groups/${taskGroup.id}`)
   const groupBody = group.json as { agents: unknown[]; workerTasks: unknown[] }
   assert.equal(groupBody.agents.length, 4)
   assert.equal(groupBody.workerTasks.length, 2)
+
+  const encodedTasks = await inject(application, "POST", `/api/task-groups/${taskGroup.id}/workers`, {
+    request_id: "stringified-tasks",
+    tasks: JSON.stringify([
+      { agent_name: "control-plane-worker", field_key: "worker_a", title: "Worker A", prompt: "检查 README" },
+    ]),
+  })
+  assert.equal(encodedTasks.statusCode, 400)
+  assert.equal((encodedTasks.json as { error: { code: string } }).error.code, "INVALID_TASKS_ARRAY_REQUIRED")
+  assert.match((encodedTasks.json as { error: { message: string } }).error.message, /actual JSON array/)
 
   const unknownType = await inject(application, "POST", `/api/task-groups/${taskGroup.id}/workers`, {
     request_id: "unknown-agent-type",
@@ -742,16 +811,21 @@ test("ambiguous permissions route directly to the dedicated approval Agent", asy
     "GET",
     `/api/permissions?status=PENDING&task_group_id=${taskGroup.id}`,
   )
-  const pending = (pendingResponse.json as { items: Array<{ id: string; reviewRequested: boolean }> }).items[0]
+  const pending = (pendingResponse.json as { items: Array<{ id: string; reviewRequested: boolean; approvalSessionId: string }> }).items[0]
   assert.equal(pending.reviewRequested, true)
   assert.equal(adapter.prompts.some((prompt) => prompt.sessionId === main.opencodeSessionId && /review_permission/.test(prompt.input.system ?? "")), false)
-  const approvalPrompt = adapter.prompts.find((prompt) => prompt.sessionId === approver.opencodeSessionId && /review_permission/.test(prompt.input.system ?? ""))
+  assert.notEqual(pending.approvalSessionId, approver.opencodeSessionId)
+  const approvalPrompt = adapter.prompts.find((prompt) => prompt.sessionId === pending.approvalSessionId && /review_permission/.test(prompt.input.system ?? ""))
   assert.ok(approvalPrompt)
   assert.equal(approvalPrompt.input.agent, "permission-approver")
   assert.equal(Object.hasOwn(approvalPrompt.input, "tools"), false)
+  assert.match(approvalPrompt.input.text, /有一条 Agent 权限请求等待审核/)
+  assert.match(approvalPrompt.input.text, /Worker 分配任务：履约费/)
+  assert.match(approvalPrompt.input.text, /配置的工作空间/)
+  assert.match(approvalPrompt.input.system ?? "", /必须且只能调用一次 review_permission/)
 
   const recommendation = await inject(application, "POST", "/internal/orchestrator/permission-reviews", {
-    caller_session_id: approver.opencodeSessionId,
+    caller_session_id: pending.approvalSessionId,
     permission_id: pending.id,
     review: "approve_once",
     reason: "只读财务查询",
@@ -768,9 +842,9 @@ test("ambiguous permissions route directly to the dedicated approval Agent", asy
   })
   assert.equal(highRisk?.status, "PENDING")
   assert.equal(highRisk?.risk, "HIGH")
-  assert.ok(adapter.prompts.some((prompt) => prompt.sessionId === approver.opencodeSessionId && /python scripts\/query\.py/.test(prompt.input.text)))
+  assert.ok(adapter.prompts.some((prompt) => prompt.sessionId === highRisk?.approvalSessionId && /python scripts\/query\.py/.test(prompt.input.text)))
   const escalated = await inject(application, "POST", "/internal/orchestrator/permission-reviews", {
-    caller_session_id: approver.opencodeSessionId,
+    caller_session_id: highRisk?.approvalSessionId,
     permission_id: highRisk?.id,
     review: "escalate",
     reason: "无法确认脚本是否只读",
@@ -782,6 +856,100 @@ test("ambiguous permissions route directly to the dedicated approval Agent", asy
   assert.equal(human.statusCode, 200)
   assert.equal((human.json as { decisionSource: string }).decisionSource, "HUMAN")
   assert.equal(adapter.permissionReplies.at(-1)?.decision, "always")
+})
+
+test("each approval review uses a fresh session while the logical approver shows one timeline", async () => {
+  const adapter = new FakeAdapter()
+  const application = createApplication({ config, adapter: adapter as unknown as OpenCodeAdapter })
+  const created = await inject(application, "POST", "/api/task-groups", { title: "无状态审批测试" })
+  const { taskGroup, agent: main, approver } = created.json as {
+    taskGroup: { id: string }
+    agent: { opencodeSessionId: string }
+    approver: { id: string; opencodeSessionId: string }
+  }
+
+  const first = await application.permissionManager.ingest({
+    id: "per_fresh_1",
+    sessionID: main.opencodeSessionId,
+    permission: "webfetch",
+    resources: ["https://example.com/one"],
+  })
+  const second = await application.permissionManager.ingest({
+    id: "per_fresh_2",
+    sessionID: main.opencodeSessionId,
+    permission: "finance_query",
+    resources: ["revenue"],
+  })
+  assert.ok(first?.approvalSessionId)
+  assert.ok(second?.approvalSessionId)
+  assert.notEqual(first.approvalSessionId, second.approvalSessionId)
+  assert.notEqual(first.approvalSessionId, approver.opencodeSessionId)
+  assert.equal(adapter.sessions.filter((session) => session.parentID === main.opencodeSessionId).length, 2)
+
+  const wrongCaller = await inject(application, "POST", "/internal/orchestrator/permission-reviews", {
+    caller_session_id: second.approvalSessionId,
+    permission_id: first.id,
+    review: "approve_once",
+    reason: "不应允许跨审批会话回调",
+  })
+  assert.equal(wrongCaller.statusCode, 403)
+
+  const reviewed = await inject(application, "POST", "/internal/orchestrator/permission-reviews", {
+    caller_session_id: first.approvalSessionId,
+    permission_id: first.id,
+    review: "approve_once",
+    reason: "仅本次读取明确 URL",
+  })
+  assert.equal(reviewed.statusCode, 200)
+
+  const duplicate = await inject(application, "POST", "/internal/orchestrator/permission-reviews", {
+    caller_session_id: first.approvalSessionId,
+    permission_id: first.id,
+    review: "reject",
+    reason: "第二次结论应被忽略",
+  })
+  assert.equal(duplicate.statusCode, 200)
+  assert.equal((duplicate.json as { decision: string; approvalReview: string }).decision, "once")
+  assert.equal((duplicate.json as { decision: string; approvalReview: string }).approvalReview, "approve_once")
+
+  const timeline = await inject(application, "GET", "/api/agents/" + approver.id + "/messages")
+  const messages = (timeline.json as { items: OpenCodeMessage[] }).items
+  assert.equal(messages.filter((message) => message.info.role === "user").length, 2)
+  assert.ok(messages.some((message) =>
+    message.parts.some((part) => part.type === "tool" && part.tool === "review_permission"),
+  ))
+})
+
+test("main Agent can replace the task-specific approval policy used by the approval Agent", async () => {
+  const adapter = new FakeAdapter()
+  const application = createApplication({ config, adapter: adapter as unknown as OpenCodeAdapter })
+  const created = await inject(application, "POST", "/api/task-groups", { title: "动态审批策略测试" })
+  const { taskGroup, agent: main, approver } = created.json as {
+    taskGroup: { id: string }
+    agent: { opencodeSessionId: string }
+    approver: { opencodeSessionId: string }
+  }
+
+  const policy = "本任务只允许读取 workspace-template；任何网络访问都升级人工。"
+  const updated = await inject(application, "POST", "/internal/orchestrator/set-approval-policy", {
+    caller_session_id: main.opencodeSessionId,
+    policy,
+  })
+  assert.equal(updated.statusCode, 200)
+  assert.equal((updated.json as { policy: string }).policy, policy)
+
+  const details = await inject(application, "GET", "/api/task-groups/" + taskGroup.id)
+  assert.equal((details.json as { taskGroup: { approvalPolicy: string } }).taskGroup.approvalPolicy, policy)
+
+  await application.permissionManager.ingest({
+    id: "per_dynamic_policy",
+    sessionID: main.opencodeSessionId,
+    permission: "webfetch",
+    resources: ["https://example.com"],
+  })
+  const review = adapter.prompts.find((prompt) => prompt.input.text.includes("任何网络访问都升级人工"))
+  assert.ok(review)
+  assert.match(review.input.text, /任何网络访问都升级人工/)
 })
 
 test("workers ask the main Agent and receive an answer in their own session", async () => {
@@ -913,10 +1081,10 @@ test("complete team flow keeps every role in one workspace-scoped OpenCode runti
     patterns: ["shipping_cost"],
   })
   assert.equal(unknownPermission?.status, "PENDING")
-  assert.equal(adapter.prompts.at(-1)?.sessionId, approver.opencodeSessionId)
+  assert.equal(adapter.prompts.at(-1)?.sessionId, unknownPermission?.approvalSessionId)
   assert.equal(adapter.prompts.at(-1)?.input.agent, "permission-approver")
   const approved = await inject(application, "POST", "/internal/orchestrator/permission-reviews", {
-    caller_session_id: approver.opencodeSessionId,
+    caller_session_id: unknownPermission?.approvalSessionId,
     permission_id: unknownPermission?.id,
     review: "approve_once",
     reason: "范围明确的单字段只读查询。",

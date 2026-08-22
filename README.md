@@ -94,7 +94,7 @@ npm start
 | 主从通信 | Worker 通过工具询问主 Agent，主 Agent 可回答或主动追问 |
 | 原生 Agent 配置 | 使用 OpenCode `opencode.json` 或 Markdown Agent 控制提示词和工具权限 |
 | 三层权限审批 | 静态规则 → 专用审批 Agent → 必要时人工接管 |
-| Web 工作台 | 切换 Agent、Markdown 消息、折叠工具、停止本轮、查看权限状态 |
+| Web 工作台 | 创建、改名或删除团队；切换主 Agent、Worker 或只读审批时间线；展示 Markdown、折叠工具、停止本轮和权限状态 |
 | Diff 人工确认 | 左右分栏展示真实文件差异，用户确认后工具向 Agent 返回 `ok` |
 | Watch Job | 长任务到期后自动唤醒原 Session 继续查询结果 |
 | 持久化恢复 | SQLite 保存团队、Worker、权限、审计、Diff 与定时任务 |
@@ -127,7 +127,7 @@ workspace-template/.opencode/agents/<agent-name>.md
 ## 详细功能
 
 - 启动时探测 OpenCode 健康状态、版本和 OpenAPI 路由。
-- 创建 TaskGroup，并自动创建独立的主 Agent Session 和权限审批 Agent Session。
+- 创建 TaskGroup 和独立的主 Agent Session，同时登记一个只读的逻辑审批 Agent；真正审批时才为该请求创建一次性审批 Session。
 - 向主 Agent 异步发送消息。
 - 加载完整 OpenCode 消息历史。
 - 中止主 Agent 当前运行。
@@ -139,15 +139,20 @@ workspace-template/.opencode/agents/<agent-name>.md
 - 项目级 `spawn_workers` Custom Tool 允许主 Agent 自主决定 Worker 数量并发起分工。
 - 主 Agent、审批 Agent 和默认 Worker 都是 `opencode.json` 中的原生命名 Agent；后端通过消息请求里的 `agent` 名称选择它们。
 - 工具可见性与基础权限完全由 OpenCode Agent 的 `permission` 配置决定；后端不再注入 Prompt 级 `tools` 或 Session 级权限覆盖。
+- OpenCode 原生 `allow` 的工具直接执行，不产生后台审批记录；只有原生配置判定为 `ask` 的调用才进入 Control Plane。
 - 同时兼容 OpenCode 1.17.15 的传统权限接口和 V2 权限事件。
 - Worker 使用明确选择的 OpenCode Agent 定义；需要开放 `ask_main_agent`、禁用 `question` 或增删其他工具时，只修改 OpenCode 配置，不需要改后端代码。
 - 主 Agent 可通过 `list_agent_types` 查看当前工作区加载的 OpenCode Agent 类型，通过 `list_active_agents` 查看本团队可复用的存活 Worker；只有不存在合适实例时才使用 `spawn_workers`。
+- 主 Agent 和 Control Plane Worker 使用白名单式权限：`*` 默认 `deny`，只把需要的工具逐个设为 `allow` 或 `ask`，并明确设置 `permission.task: deny`。这样原生 `task` 会从模型上下文中消失；配置中同时保留 `tools.task: false` 以兼容采用新配置语义的 OpenCode 版本。团队 Worker 只能通过 `spawn_workers` 创建，确保它们拥有独立、可见、可继续沟通的 Session。
+- `spawn_workers.tasks` 必须直接传对象数组，不能把数组 `JSON.stringify` 后作为字符串传入。传错类型时接口会返回 `INVALID_TASKS_ARRAY_REQUIRED` 和可操作的修正提示。
 - Worker 持久记录所选 OpenCode Agent 名称，初次任务、后续追问和主子通信都会重复携带该名称，避免后续消息回落到默认 Build Agent。
 - Worker 遇到业务问题时通过 `ask_main_agent` 询问主 Agent，主 Agent 通过 `answer_worker` 回答；主 Agent也可查询和主动指导 Worker。
-- 低风险只读操作自动允许一次，明确的删除、强制 Git 和写数据库行为自动拒绝。
-- 其他不确定权限直接交给专用权限审批 Agent，通过 `review_permission` 决定允许一次、拒绝或升级人工。
+- 模板已在 OpenCode 层直接允许 `read`、`grep`、`glob`、`list` 和 `skill`；若其他 Agent 配置或 Session 覆盖仍对只读操作发出 `ask`，后台静态规则会作为兼容性兜底允许一次。明确的删除、强制 Git 和写数据库行为仍由后台静态规则直接拒绝。
+- 其他不确定权限直接交给专用权限审批 Agent。每条请求都创建全新的临时 Session，并完整附带命令、风险与当时的审批原则，因此不会继承上一条审批的上下文；`review_permission` 可决定允许一次、拒绝或升级人工。
+- 每个团队创建时都有保守默认审批原则；主 Agent 可根据用户要求调用 `set_approval_policy` 动态替换，后端会把当前原则附在每次审批请求中。
 - 最终权限回复始终由后端 Permission Manager 发出；审批 Agent 永远不能授予 `always`。
 - 页面权限中心展示静态规则、审批 Agent 和人工三轮判断的最近记录；待处理项支持“允许一次 / 本任务始终允许 / 拒绝”。
+- 页面中的“权限审批 Agent”是多个一次性审批 Session 的聚合时间线，不是一个会持续压缩和继承历史的长期 Session。
 - 使用 Node.js 内置 SQLite 持久化 TaskGroup、Agent、WorkerTask、权限、审计和 Worker 幂等键。
 - 启动时把本地 Agent 与 OpenCode Session 对账：存在的 Session 恢复，缺失的 Session 标记失败。
 - 页面“最近任务”支持服务重启后重新进入原来的主 Agent 和 Worker。
@@ -164,7 +169,9 @@ workspace-template/.opencode/agents/<agent-name>.md
 ## 权限处理顺序
 
 ```text
-OpenCode permission.asked
+OpenCode 原生 permission：allow 直接执行，deny 直接拒绝
+          ↓ 只有 ask 产生 permission.asked
+Control Plane 接收 permission.asked
           ↓
 静态规则：低风险自动允许 / 明确危险自动拒绝
           ↓ 其他不确定操作
@@ -175,7 +182,39 @@ OpenCode permission.asked
 Permission Manager 回复 OpenCode
 ```
 
-`always` 只能由人在页面或公开 API 中选择，主 Agent和审批 Agent都无法授予永久权限。
+`always` 只能由人在页面或公开 API 中选择，主 Agent和审批 Agent都无法授予永久权限。后台静态规则不是 OpenCode 原生规则的替代品：它只处理 OpenCode 已经发出的 `ask`，主要承担危险操作硬拒绝、兼容性兜底和二次路由。
+
+页面会区分三种待处理状态：
+
+- “Agent 审批中”：独立审批 Session 已创建，正在等待它返回；
+- “待人工”：审批 Agent 已明确返回 `escalate`，页面同时展示升级原因，必须由人允许或拒绝；
+- “等待路由”：请求刚进入后端，尚未完成静态判断或审批转发。
+
+审批请求会附带来源 Agent、Worker 分配任务、最近三条用户消息、配置的工作空间、权限元数据和当时的团队审批原则。最近消息与任务文本只作为不可信背景资料，并限制长度，避免把整个对话无限塞入审批模型或让任务中的提示注入覆盖安全规则。审批 Agent 第一次调用 `review_permission` 后，该结论即被锁定；重复调用会被忽略，临时 Session 随后中止并删除。
+
+### 外部目录白名单
+
+`external_directory` 是 OpenCode 原生权限，不是 Control Plane Custom Tool。固定目录白名单应优先配置在对应 Agent 的 `permission` 中：
+
+```json
+{
+  "permission": {
+    "external_directory": {
+      "/Users/you/approved-data/**": "allow",
+      "/Users/you/secrets/**": "deny",
+      "*": "ask"
+    },
+    "read": {
+      "/Users/you/approved-data/**": "allow"
+    },
+    "edit": {
+      "/Users/you/approved-data/**": "deny"
+    }
+  }
+}
+```
+
+规则按顺序匹配，最后一个命中的规则生效。允许 `external_directory` 只是允许 OpenCode 跨出当前工作空间访问该目录；具体的 `read`、`edit`、`bash` 等操作仍按各自规则判断。外部目录默认继承工作空间内的工具权限，所以如果只想开放读取，必须显式拒绝该路径的编辑，并谨慎限制 Bash。只有任务运行时才动态变化的目录授权，才适合由 Control Plane 团队审批原则或未来的后端动态白名单补充。
 
 ## 文件 Diff 人工确认
 
@@ -216,7 +255,7 @@ diff_review(before_file, after_file)
               Agent 自行决定后续提交操作
 ```
 
-`diff_review` 与编辑工具相互独立。它只负责对比、展示和返回人工决定，不保存发布授权，不拦截 `git push`，也不会替 Agent 提交代码。因为结果直接返回当前工具调用，所以不需要额外向 Agent Session 补发消息。
+`diff_review` 与编辑工具相互独立。模板把它配置为 OpenCode `allow`，所以调用时不会产生普通的 `permission.asked`，也不会进入静态规则或审批 Agent。工具本身在 Control Plane 内建立一个独立且只能由页面用户完成的人工闸门：生成真实 Diff 后挂起当前工具调用，用户确定才返回 `ok`，拒绝则返回 `rejected`。它不保存发布授权，不拦截 `git push`，也不会替 Agent 提交代码。因为结果直接返回当前工具调用，所以不需要额外向 Agent Session 补发消息。
 
 注意事项：
 
@@ -247,6 +286,8 @@ SQLite 保存提醒；Agent 和模型都不需要持续运行
 ```
 
 Watch Job 只保证“到时唤醒并要求检查”，并不假设外部任务一定已经完成。最长单次延迟为 7 天；`idempotency_key` 可防止同一次工具调用重试时重复登记。
+
+如果定时消息或主 Agent 的监督消息到达时，目标 Session 正在等待权限或其他工具结果，Control Plane 仍调用 OpenCode 的异步 Prompt 接口。OpenCode 将新 Prompt 排在该 Session 当前执行之后，不会把一条裸 `user` 消息插进未完成的 tool call/result 中间；权限回复先恢复并完成当前工具调用，排队消息随后执行。多条消息可能按到达顺序连续触发，所以监督消息和 Watch Job 不会破坏消息结构，但仍可能形成多个连续检查。
 
 ## 环境要求
 
@@ -335,7 +376,7 @@ Control Plane 不在前端创建 Agent。Agent 类型由 OpenCode 自己的配�
 
 团队工作空间模板已经在 [opencode.json](workspace-template/opencode.json) 中提供三个默认定义：
 
-- `control-plane-main`：团队主 Agent，可使用编排、主从通信、Diff 审查和 Watch Job 工具。
+- `control-plane-main`：团队主 Agent，可使用编排、主从通信、动态审批原则、Diff 审查和 Watch Job 工具。
 - `permission-approver`：隐藏的审批 Agent，只能看到 `review_permission`。
 - `control-plane-worker`：通用 Worker，可使用 `ask_main_agent`，看不到 `question` 和团队管理工具。
 
@@ -384,6 +425,8 @@ Markdown 正文是该 Agent 的专用系统提示词，但不是必填项。只�
 - `ask` 的工具对模型可见，调用后进入 Control Plane 权限审批流程。
 - `allow` 的工具对模型可见并由 OpenCode 直接执行。
 
+因为 `allow` 不会产生 `permission.asked`，Control Plane 权限记录中不会出现 `list_agent_types`、`read` 等已直接放行的调用；这正是预期行为。只有 `ask` 会进入后端三层审批。
+
 注意：`"*": "ask"` 不是“只开放后面列出的工具”，而是“所有未单独覆盖的工具都可见，调用时询问”。因此当前主 Agent 和通用 Worker 保留正常 OpenCode 工具；审批 Agent 使用 `"*": "deny"`，所以实际上只看得到单独允许的 `review_permission`。
 
 不要再使用旧的布尔 `tools` 配置；OpenCode 1.17.15 仍兼容它，但官方已推荐改用 `permission`。
@@ -397,7 +440,7 @@ Control Plane 调用 OpenCode 时，与 Agent 选择和工具权限相关的关�
 }
 ```
 
-后端还会发送用户文本、模型和 Control Plane 的动态协作说明，但不会再发送 `tools`，创建 Session 时也不会附加 `permission`。因此 OpenCode 最终给模型暴露哪些工具、哪些调用直接允许、拒绝或发出 `ask`，都以所选命名 Agent 的配置为准。Control Plane 只在 OpenCode 已经产生 `ask` 事件之后负责静态过滤、审批 Agent 路由、人工接管和最终回复。
+后端还会发送用户文本、模型和 Control Plane 的动态协作说明，但不会再发送 `tools`，创建 Session 时也不会附加 `permission`。因此 OpenCode 最终给模型暴露哪些工具、哪些调用直接允许、拒绝或发出 `ask`，都以所选命名 Agent 的配置为准。Control Plane 只在 OpenCode 已经产生 `ask` 事件之后负责静态过滤、审批 Agent 路由、人工接管和最终回复。主 Agent 还可以调用 `set_approval_policy` 保存当前团队的任务级审批原则；该原则只影响第 2 轮审批 Agent，不能绕过第 1 轮的危险操作硬拒绝。
 
 主 Agent 调度顺序固定为：
 
@@ -419,6 +462,8 @@ GET  /health
 POST /api/task-groups
 GET  /api/task-groups
 GET  /api/task-groups/:id
+PATCH /api/task-groups/:id
+DELETE /api/task-groups/:id
 POST /api/task-groups/:id/workers
 POST /api/agents/:id/messages
 GET  /api/agents/:id/messages
@@ -435,6 +480,7 @@ GET  /api/audit
 POST /internal/orchestrator/spawn-workers
 POST /internal/orchestrator/list-agent-types
 POST /internal/orchestrator/list-active-agents
+POST /internal/orchestrator/set-approval-policy
 POST /internal/orchestrator/diff-review
 POST /internal/orchestrator/watch-job
 POST /internal/orchestrator/ask-main
@@ -476,7 +522,7 @@ curl -X POST http://127.0.0.1:4100/api/permissions/<permission-id>/decision \
   -d '{"decision":"once","rationale":"人工确认只读查询"}'
 ```
 
-页面只负责创建 Agent Team 和对话。用户把完整任务交给主 Agent；主 Agent先通过工作空间里的 `.opencode/tools/list_agent_types.ts` 和 `list_active_agents.ts` 了解可用类型与现有实例，再决定复用 Worker 或通过 `spawn_workers.ts` 创建独立 Worker Session。Worker 通过 `ask_main_agent.ts` 向主 Agent 求助；权限请求由后端直接发给隐藏的权限审批 Agent，并由 `review_permission.ts` 返回结构化决定。
+页面负责创建、改名、删除 Agent Team 和对话。团队名称不能为空；删除会取消未完成的 Watch Job 与 Diff 审查、拒绝仍在等待的权限，并清理该团队的 OpenCode Session 与本地记录。用户把完整任务交给主 Agent；主 Agent先通过工作空间里的 `.opencode/tools/list_agent_types.ts` 和 `list_active_agents.ts` 了解可用类型与现有实例，再决定复用 Worker 或通过 `spawn_workers.ts` 创建独立 Worker Session。Worker 通过 `ask_main_agent.ts` 向主 Agent 求助；未知权限由后端创建全新的一次性审批 Session，选择隐藏的 `permission-approver`，并由 `review_permission.ts` 返回结构化决定。
 
 `watch_job.ts` 会把当前 Custom Tool 上下文里的 Session ID 连同延迟和唤醒消息登记到后端。它不会在工具调用中等待；到期后后端使用 OpenCode 的异步消息接口唤醒原 Session。公开接口 `GET /api/job-watches?task_group_id=<id>` 可查看记录，`POST /api/job-watches/<id>/cancel` 可取消尚未触发的记录。
 

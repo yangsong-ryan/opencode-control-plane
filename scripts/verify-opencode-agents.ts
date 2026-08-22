@@ -6,13 +6,13 @@ import { join, resolve } from "node:path"
 const definitions = [
   {
     name: "control-plane-main",
-    promptMarker: "NATIVE_MAIN_PROMPT_V1",
-    enabled: ["list_agent_types", "list_active_agents", "spawn_workers", "answer_worker", "list_workers", "message_worker", "diff_review", "watch_job"],
-    disabled: ["ask_main_agent", "review_permission"],
+    promptMarker: "NATIVE_MAIN_PROMPT_V2",
+    enabled: ["list_agent_types", "list_active_agents", "set_approval_policy", "spawn_workers", "answer_worker", "list_workers", "message_worker", "diff_review", "watch_job"],
+    disabled: ["task", "ask_main_agent", "review_permission"],
   },
   {
     name: "permission-approver",
-    promptMarker: "NATIVE_APPROVER_PROMPT_V1",
+    promptMarker: "NATIVE_APPROVER_PROMPT_V2",
     enabled: ["review_permission"],
     disabled: ["spawn_workers", "bash", "read", "edit", "question", "ask_main_agent", "diff_review"],
   },
@@ -20,7 +20,7 @@ const definitions = [
     name: "control-plane-worker",
     promptMarker: "NATIVE_WORKER_PROMPT_V1",
     enabled: ["ask_main_agent", "diff_review", "watch_job", "bash", "read"],
-    disabled: ["question", "list_agent_types", "list_active_agents", "spawn_workers", "answer_worker", "list_workers", "message_worker", "review_permission"],
+    disabled: ["task", "question", "list_agent_types", "list_active_agents", "set_approval_policy", "spawn_workers", "answer_worker", "list_workers", "message_worker", "review_permission"],
   },
 ] as const
 

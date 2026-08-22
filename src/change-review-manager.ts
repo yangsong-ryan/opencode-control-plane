@@ -234,6 +234,18 @@ export class ChangeReviewManager {
     return review
   }
 
+  cancelTaskGroup(taskGroupId: string): number {
+    const pending = this.store.listChangeReviews({ taskGroupId, status: "PENDING" })
+    for (const review of pending) {
+      this.decide({
+        reviewId: review.id,
+        decision: "reject",
+        rationale: "团队已删除，未完成的差异审查已取消。",
+      })
+    }
+    return pending.length
+  }
+
   private requireProjectAgent(sessionId: string): AgentInstance {
     const agent = this.store.getAgentBySession(sessionId)
     if (agent === undefined || agent.role === "APPROVER") throw new Error("CALLER_IS_NOT_PROJECT_AGENT")
